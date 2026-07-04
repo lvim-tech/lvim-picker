@@ -1,0 +1,68 @@
+*lvim-picker.txt*                            The fuzzy finders of the lvim-tech set
+
+==============================================================================
+CONTENTS                                                   *lvim-picker-contents*
+
+    1. Introduction ......................... |lvim-picker-introduction|
+    2. Requirements ......................... |lvim-picker-requirements|
+    3. Installation ......................... |lvim-picker-installation|
+    4. Usage ................................ |lvim-picker-usage|
+    5. Configuration ........................ |lvim-picker-configuration|
+
+==============================================================================
+1. INTRODUCTION                                        *lvim-picker-introduction*
+
+A unified fuzzy picker (files / grep / buffers / git / LSP locations /
+diagnostics / marks / …) with a real fzf TUI backend for the heavy
+command-driven finders and a Lua tint-list backend for the structured ones, plus
+the shared fuzzy matching engine. Every finder shares one look and one set of
+keys, and docks as a centred float, a bottom dock, or the message-zone area.
+
+==============================================================================
+2. REQUIREMENTS                                        *lvim-picker-requirements*
+
+- Neovim >= 0.12.x
+- lvim-utils and lvim-ui
+- the `fzf` binary (+ `mkfifo`) for the fzf-TUI backend (falls back to the Lua
+  tint list without it)
+- optional: lvim-hud (statusline overlay), lvim-msgarea (the `area` dock)
+
+==============================================================================
+3. INSTALLATION                                        *lvim-picker-installation*
+
+lvim-installer (recommended): >vim
+    :LvimInstaller plugins
+<
+Native (vim.pack): >lua
+    vim.pack.add({
+        { src = "https://github.com/lvim-tech/lvim-utils" },
+        { src = "https://github.com/lvim-tech/lvim-ui" },
+        { src = "https://github.com/lvim-tech/lvim-picker" },
+    })
+    require("lvim-picker").setup({})
+<
+==============================================================================
+4. USAGE                                                      *lvim-picker-usage*
+
+setup() registers `:LvimPicker <finder> [area|float|bottom]`; each finder is also
+a Lua function: >vim
+    :LvimPicker files
+    :LvimPicker grep float
+<
+>lua
+    local pick = require("lvim-picker")
+    pick.files()  pick.grep()  pick.buffers()  pick.git_files()  pick.marks()
+<
+==============================================================================
+5. CONFIGURATION                                      *lvim-picker-configuration*
+
+                                                           *lvim-picker.setup()*
+require("lvim-picker").setup({opts})
+
+Merges {opts} into the live config in place (a nested `fuzzy` subtable merges
+into `lvim-picker.fuzzy.config`) and registers `:LvimPicker`. Optional. See the
+README for the FULL default config; the option set is documented as
+`LvimPickerConfig` in `lua/lvim-picker/config.lua` (layout, fzf_tui, keys,
+marker, footer, source, prompt, caret, hl, preview, preview_heights, …).
+
+vim:tw=78:ts=8:ft=help:norl:
