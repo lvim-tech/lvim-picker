@@ -525,7 +525,8 @@ function M.open(opts)
             -- the file's icon (from the configured icon_provider, when `preview.show_icon`)
             local icon = ""
             if prevcfg.show_icon ~= false then
-                local gl = iconlib.get(tail, { provider = config.icon_provider }).glyph
+                local gl =
+                    iconlib.get(tail, { provider = config.icon_provider, color_mode = config.icon_color_mode }).glyph
                 icon = (gl and gl ~= "") and (gl .. " ") or ""
             end
             -- name = icon + file (bright); dir = padded path on the winbar bg (so it blends into the bar)

@@ -15,6 +15,7 @@
 ---@field source          table    files/directories listing engine + what it ignores (engine / exclude / hidden / …)
 ---@field icons           table    Shared glyphs used by source helpers
 ---@field icon_provider    "auto"|"lvim"|"devicons"|"mini"  Which plugin supplies file icons (via lvim-utils.icons)
+---@field icon_color_mode  string?  lvim-icons colour mode for file icons: "theme"|"brand"|"theme_brand"; nil = the lvim-icons global default
 ---@field prompt          table    The prompt badge before the query (icon / label / spacing pads)
 ---@field caret           table    The input caret (hl group + guicursor shape)
 ---@field hl              table    Highlight groups for every finder element (all overridable)
@@ -74,6 +75,9 @@ return {
     -- Which icon plugin supplies file glyphs (both backends), resolved through lvim-utils.icons:
     -- "auto" prefers lvim-icons, then nvim-web-devicons, then mini.icons, else no icons.
     icon_provider = "auto",
+    -- lvim-icons colour mode for file icons (ignored by devicons/mini): "theme" follows the
+    -- colorscheme, "brand" the real brand hue, "theme_brand" a mix. nil = lvim-icons' own default.
+    icon_color_mode = nil,
     icons = {
         directory = "󰉋",
     },

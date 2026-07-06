@@ -227,7 +227,7 @@ local function set_preview_winbar(pan, item)
         local tail = vim.fn.fnamemodify(rel, ":t")
         local dir = vim.fn.fnamemodify(rel, ":h")
         dir = (dir == "." or dir == "") and "" or (dir .. "/")
-        local gl = iconlib.get(tail, { provider = config.icon_provider }).glyph
+        local gl = iconlib.get(tail, { provider = config.icon_provider, color_mode = config.icon_color_mode }).glyph
         local icon = (gl and gl ~= "") and (gl .. " ") or ""
         vim.wo[pan.win].winbar = ("%%#%s# %s%s %%#%s# %s %%#%s#%%="):format(
             FILE,

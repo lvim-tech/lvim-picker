@@ -195,7 +195,7 @@ local function icons()
     if icon_state ~= nil then
         return icon_state
     end
-    local provider = config.icon_provider
+    local provider, color_mode = config.icon_provider, config.icon_color_mode
     local function ansi(glyph, color)
         local r, g, b = (color or ""):match("^#(%x%x)(%x%x)(%x%x)$")
         if not r then
@@ -204,7 +204,7 @@ local function icons()
         return ("\27[38;2;%d;%d;%dm%s\27[0m"):format(tonumber(r, 16), tonumber(g, 16), tonumber(b, 16), glyph)
     end
     local lines = {}
-    for key, def in pairs(iconlib.get_icons({ provider = provider })) do
+    for key, def in pairs(iconlib.get_icons({ provider = provider, color_mode = color_mode })) do
         if def.icon then
             lines[#lines + 1] = key .. "\t" .. ansi(def.icon, def.color)
         end
@@ -214,7 +214,7 @@ local function icons()
         icon_state = false
         return icon_state
     end
-    local dr = iconlib.get("", { provider = provider })
+    local dr = iconlib.get("", { provider = provider, color_mode = color_mode })
     local f = vim.fn.tempname()
     pcall(vim.fn.writefile, lines, f)
     icon_state = { map = f, default = ansi(dr.glyph or "", dr.color) }
@@ -298,7 +298,7 @@ function M.file_icon(name)
     if lua_icon_cache[key] ~= nil then
         return lua_icon_cache[key]
     end
-    local r = iconlib.get(name, { provider = config.icon_provider })
+    local r = iconlib.get(name, { provider = config.icon_provider, color_mode = config.icon_color_mode })
     local s = r.glyph or ""
     local rr, gg, bb = (r.color or ""):match("^#(%x%x)(%x%x)(%x%x)$")
     if rr and s ~= "" then
@@ -318,7 +318,7 @@ function M.devicon(name)
     if (config or {}).show_icons == false then
         return nil
     end
-    local r = iconlib.get(name, { provider = config.icon_provider })
+    local r = iconlib.get(name, { provider = config.icon_provider, color_mode = config.icon_color_mode })
     return r.glyph, r.hl
 end
 
