@@ -54,6 +54,34 @@ function M.check()
     end
 
     -- Optional integrations.
+    if has("lvim-utils.dock") then
+        ok(
+            "lvim-utils.dock present — each finder KIND is a dock-stack entry, BOTH backends (fzf-TUI + tint); "
+                .. "natural close parks+remembers (cycle <Leader>n/p, kill <Leader>x, menu <Leader>m)"
+        )
+        -- Report the picker's own docking mode + any per-layout force overrides (a caller can still override
+        -- either per call via opts.dock_stack / opts.force).
+        local cfg = require("lvim-picker.config")
+        if cfg.dock.dock_stack == false then
+            info("config.dock.dock_stack = false — finders open geometry-only (standalone), NOT in the dock stack")
+        else
+            ok("config.dock.dock_stack = true — finders join the managed dock stack")
+        end
+        for _, lay in ipairs({ "float", "area", "bottom" }) do
+            local f = (cfg.dock.force or {})[lay]
+            if type(f) == "table" and next(f) then
+                info(
+                    ("config.dock.force.%s set — anchored geometry override over the central dock geometry"):format(
+                        lay
+                    )
+                )
+            end
+        end
+    else
+        info(
+            "lvim-utils.dock not available — finders fall back to the classic one-open-at-a-time replace-in-place (optional)"
+        )
+    end
     if has("lvim-hud.overlay") then
         ok("lvim-hud present — a finder title can publish to the statusline overlay")
     else

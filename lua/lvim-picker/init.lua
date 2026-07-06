@@ -12,7 +12,6 @@
 
 local api = vim.api
 local config = require("lvim-picker.config")
-local ui_config = require("lvim-ui.config")
 local fuzzy = require("lvim-picker.fuzzy")
 local utils = require("lvim-utils.utils")
 local iconlib = require("lvim-utils.icons")
@@ -53,11 +52,16 @@ end
 
 local M = {}
 
+-- forward declaration: opens a finder through the fzf-TUI backend MANAGED by the dock stack (defined far
+-- below, after the dock layer it depends on). `pick_items` + the command-driven finders funnel their fzf
+-- branch through it, so both backends dock through the SAME layer.
+local open_fzf
+
 --- Route a Lua-ITEM finder through the fzf-TUI backend when available, else the tint list — so EVERY finder
 --- shares one backend (only the structured lsp/diagnostics lists stay tint). Each item is encoded as
 --- `idx\ttext`; fzf shows/matches only the text (`--with-nth`), and the idx recovers the full item on
 --- selection, so the finder keeps its own `preview` / `on_confirm` / `on_cancel` for BOTH backends.
----@param spec { title: string, items: table[], preview?: function, on_confirm?: function, on_cancel?: function, opts?: table }
+---@param spec { title: string, items: table[], icon?: boolean, preview?: function, on_confirm?: function, on_cancel?: function, opts?: table }
 local function pick_items(spec)
     local items = spec.items or {}
     local b = fzf_backend()
@@ -69,18 +73,21 @@ local function pick_items(spec)
             local icon = spec.icon and source.file_icon(it.path or it.text) or ""
             contents[i] = i .. "\t" .. icon .. ((it.text or ""):gsub("[\t\n]", " "))
         end
-        b.open(vim.tbl_extend("force", {
-            title = spec.title,
-            contents = contents,
-            fzf_args = { "--delimiter=\t", "--with-nth=2.." }, -- hide the leading index, show/match the text
-            parse = function(line)
-                local idx = tonumber(line:match("^(%d+)\t"))
-                return (idx and items[idx]) or { text = line }
-            end,
-            preview = spec.preview,
-            on_confirm = spec.on_confirm,
-            on_cancel = spec.on_cancel,
-        }, spec.opts or {}))
+        open_fzf(
+            b,
+            vim.tbl_extend("force", {
+                title = spec.title,
+                contents = contents,
+                fzf_args = { "--delimiter=\t", "--with-nth=2.." }, -- hide the leading index, show/match the text
+                parse = function(line)
+                    local idx = tonumber(line:match("^(%d+)\t"))
+                    return (idx and items[idx]) or { text = line }
+                end,
+                preview = spec.preview,
+                on_confirm = spec.on_confirm,
+                on_cancel = spec.on_cancel,
+            }, spec.opts or {})
+        )
         return
     end
     M.open(vim.tbl_extend("force", {
@@ -202,6 +209,251 @@ local function list_row(it, marked, dot)
     return row, spans, #lead
 end
 
+-- ─── dock-stack integration (lvim-utils.dock) ──────────────────────────────────
+-- Each opened finder KIND is an entry in the shared DOCK-STACK manager, whose base identity is
+-- `id = "lvim-picker:<kind>"` — so `files` ≠ `grep` ≠ `buffers` stack as distinct instances, one visible
+-- at a time, cyclable with `<Leader>n`/`<Leader>p`, killable with `<Leader>x`, listed in the `<Leader>m`
+-- menu. The dock keys every entry by (id, LAYOUT), so the SAME kind opened in a DIFFERENT layout is a
+-- SEPARATE entry with its OWN surface: `files` can be docked in float AND bottom AND area at once (one entry
+-- per stack). All open-state is therefore kept PER (kind, layout) under a composite SLOT KEY. Re-opening the
+-- SAME (kind, layout) RE-SHOWS that one entry (dedup) — since a finder has no meaningful "parked query", the
+-- re-show REBUILDS that kind fresh in place (still the single entry for that (kind, layout)).
+--
+-- ONE dock layer serves BOTH backends (the tint list here AND the fzf-TUI backend in picker/fzf.lua). A
+-- (kind, layout) slot is remembered by a `rebuild` CLOSURE (`pending[sk]`) that re-materialises THAT slot's
+-- surface with the backend it was opened with — the tint list (`build(opts, kind)`) or the fzf TUI
+-- (`require("lvim-picker.fzf").open(fzf_opts)`). The shared `route(managed, kind, layout, meta, rebuild, slot)`
+-- does the managed wiring (remember the rebuild, refresh the consumer's name / icon / anchored force slot,
+-- `dock.open` — STORING the returned entry key in `entry_keys[sk]`) or, when un-managed (no manager / no key /
+-- `dock_stack = false`), just calls `rebuild()` directly (the classic
+-- `source.close_active` replace-in-place). The consumer's `show` runs the remembered `rebuild`, `hide` parks
+-- the live surface (close it, KEEP the rebuild → restorable). A NATURAL close (confirm / cancel / q / :q, or
+-- replaced) also PARKS + REMEMBERS (via `dock.parked(entry_keys[sk])`): the entry stays alive, cyclable and in
+-- the `<Leader>m` menu — only `<Leader>x` (the consumer's `close`) forgets the rebuild + drops it. Whichever
+-- backend built it exposes its live `state` via `live[sk]`, so the consumer's
+-- `buffers` / `focus` / `is_current` work uniformly (the tint state carries `.input_buf`, the fzf state
+-- `.term_buf`; both carry `.st` / `.list_pan` / `.preview_pan`).
+
+---@type table|false|nil  cached lvim-utils.dock module (nil = unprobed, false = probed & absent)
+local dock_mod = nil
+--- The dock-stack manager, or nil when unavailable — then the picker docks directly, un-managed.
+---@return table?
+local function get_dock()
+    if dock_mod == nil then
+        local ok, m = pcall(require, "lvim-utils.dock")
+        dock_mod = ok and m or false
+    end
+    return dock_mod or nil
+end
+
+-- ── per-(kind, layout) state ─────────────────────────────────────────────────
+-- The dock keys every entry by (id, LAYOUT): the SAME finder KIND opened in a DIFFERENT layout is a
+-- SEPARATE dock entry with its OWN surface — so `files` can be docked in float AND bottom AND area at once,
+-- three live entries. Every piece of open-state is therefore kept PER (kind, layout), under a composite
+-- SLOT KEY `kind .. SK_SEP .. layout` (a re-open of the SAME (kind, layout) re-uses the slot → one entry per
+-- stack, never a duplicate). `id` stays the base identity ("lvim-picker:<kind>") — layout is NOT baked into it;
+-- the dock composes the (id, layout) entry key and RETURNS it, which we STORE in `entry_keys[sk]` and pass
+-- back to the lifecycle APIs (`parked`/`refresh_leader`/`dropped`) for THIS entry.
+local SK_SEP = "\30"
+--- Compose the per-(kind, layout) slot key.
+---@param kind string
+---@param layout string
+---@return string
+local function slot_key(kind, layout)
+    return kind .. SK_SEP .. layout
+end
+---@type table<string, table>   slot key → the memoised LvimDockConsumer handle (one per (kind, layout))
+local consumers = {}
+---@type table<string, fun()>   slot key → the REBUILD closure that re-materialises that finder on show (either
+--- backend — the tint `build` or the fzf-TUI `open`); nil = forgotten/dead (the dock's `is_alive` reads this).
+local pending = {}
+---@type table<string, table>   slot key → the live surface `state` while it exists (nil = parked). Either backend's
+--- state; the consumer reads `.st` / `.list_pan` / `.preview_pan` + `.input_buf` (tint) or `.term_buf` (fzf).
+local live = {}
+---@type table<string, string>  slot key → the dock ENTRY KEY (id, layout) returned by `dock.open` — passed back
+--- to the lifecycle APIs (`parked`/`refresh_leader`/`dropped`) for THIS entry (never a reconstructed key).
+local entry_keys = {}
+
+--- Human label + Nerd glyph per built-in finder kind — the entry name + the `<Leader>m` dock-menu row icon.
+---@type table<string, { name: string, icon: string }>
+local KIND_META = {
+    files = { name = "Files", icon = "󰈔" },
+    grep = { name = "Grep", icon = "󰊄" },
+    grep_cword = { name = "Grep (word)", icon = "󰊄" },
+    grep_cWORD = { name = "Grep (WORD)", icon = "󰊄" },
+    grep_word = { name = "Grep (prompt)", icon = "󰊄" },
+    grep_visual = { name = "Grep (selection)", icon = "󰊄" },
+    grep_curbuf = { name = "Grep (buffer)", icon = "󰊄" },
+    buffers = { name = "Buffers", icon = "󰓩" },
+    directories = { name = "Directories", icon = "󰉋" },
+    git_files = { name = "Git files", icon = "󰊢" },
+    oldfiles = { name = "Recent", icon = "󰋚" },
+    help_tags = { name = "Help", icon = "󰋖" },
+    commands = { name = "Commands", icon = "󰘳" },
+    keymaps = { name = "Keymaps", icon = "󰌌" },
+    marks = { name = "Marks", icon = "󰃀" },
+    quickfix = { name = "Quickfix", icon = "󰁨" },
+    jumplist = { name = "Jumplist", icon = "󰆾" },
+    colorschemes = { name = "Colorschemes", icon = "󰏘" },
+}
+
+-- forward declaration: `build` constructs the finder surface; a consumer's `show` calls it to materialise a kind
+local build
+
+--- Resolve the dock KIND key for a finder open (either backend): an explicit `opts.key` wins; else a stable
+--- slug from the title; else nil (no stable identity ⇒ un-managed, so it docks directly rather than force a
+--- bad key). Typed on the minimal shape both `LvimPickerOpts` and `LvimFzfOpts` satisfy.
+---@param opts { key?: string, title?: string }
+---@return string?
+local function resolve_key(opts)
+    if type(opts.key) == "string" and opts.key ~= "" then
+        return opts.key
+    end
+    local title = opts.title
+    if type(title) == "string" and title ~= "" then
+        local slug = title:lower():gsub("%s+", "-"):gsub("[^%w%-_]", "")
+        if slug ~= "" then
+            return slug
+        end
+    end
+    return nil
+end
+
+--- The live surface buffers of slot `sk` (input / list / preview / container) — where the dock installs its
+--- buffer-local `<Leader>` owner. Empty when the slot is parked (no live surface).
+---@param sk string  the (kind, layout) slot key
+---@return integer[]
+local function kind_buffers(sk)
+    local st = live[sk]
+    if not st then
+        return {}
+    end
+    local out = {}
+    local function add(b)
+        if b and api.nvim_buf_is_valid(b) then
+            out[#out + 1] = b
+        end
+    end
+    add(st.input_buf) -- tint: the query INPUT band buffer
+    add(st.term_buf) -- fzf: the terminal buffer hosting the fzf TUI (one of input_buf/term_buf is nil)
+    add(st.list_pan and st.list_pan.buf)
+    add(st.preview_pan and st.preview_pan.buf)
+    add(st.st and st.st.container_buf)
+    return out
+end
+
+--- Every live window of slot `sk`'s surface (container / content panels / input band) — for `is_current`.
+---@param sk string  the (kind, layout) slot key
+---@return integer[]
+local function kind_windows(sk)
+    local st = live[sk]
+    if not st then
+        return {}
+    end
+    local out = {}
+    local function add(w)
+        if w and w ~= -1 and api.nvim_win_is_valid(w) then
+            out[#out + 1] = w
+        end
+    end
+    local s = st.st
+    if s then
+        add(s.container_win)
+        for _, p in ipairs(s.panels or {}) do
+            add(p.win)
+        end
+    end
+    if st.input_buf then
+        add(vim.fn.bufwinid(st.input_buf))
+    end
+    return out
+end
+
+--- Build (once, memoised in `consumers[sk]`) + return the dock consumer for finder `kind` in `layout` —
+--- backend-agnostic (the tint list or the fzf TUI). There is ONE consumer PER (kind, layout): `id` is the
+--- UNCHANGED base identity (`"lvim-picker:"..kind`) — the dock composes the (id, layout) entry key — and
+--- `layout` is FIXED for this slot, so opening `files` in float and `files` in bottom are two independent
+--- consumers / surfaces / dock entries. `show` runs this slot's remembered `rebuild` (tearing down any surface
+--- still live in this slot first, so a re-open rebuilds fresh — one entry per (kind, layout)); `hide` PARKS
+--- (close the surface, KEEP the rebuild → restorable); `close` tears it down AND forgets the rebuild (dropped
+--- from the stack); `is_alive` tracks whether the rebuild is still remembered.
+---@param kind string
+---@param layout string  "float" | "area" | "bottom" — the layout THIS consumer occupies (fixed)
+---@return table  the LvimDockConsumer handle
+local function get_consumer(kind, layout)
+    local sk = slot_key(kind, layout)
+    local c = consumers[sk]
+    if c then
+        return c
+    end
+    local id = "lvim-picker:" .. kind -- base identity, UNCHANGED across layouts — the dock keys the entry by (id, layout)
+    --- Close the live surface of this slot as a DOCK-DRIVEN teardown: flag `dock_teardown` so the finder's
+    --- `on_close` neither re-notifies the dock nor forgets the opts, then close it.
+    local function teardown_surface()
+        local st = live[sk]
+        if st and st.st then
+            st.dock_teardown = true
+            pcall(st.st.close)
+        end
+    end
+    c = {
+        id = id,
+        name = kind,
+        layout = layout, -- which stack THIS entry joins (fixed for this per-(kind, layout) consumer)
+        show = function()
+            local rebuild = pending[sk]
+            if not rebuild then
+                return
+            end
+            teardown_surface() -- a re-open of the visible slot rebuilds fresh in place
+            rebuild() -- backend-specific: the tint `build(opts, kind)` or the fzf-TUI `open(fzf_opts)`
+        end,
+        hide = teardown_surface, -- PARK: close the surface, KEEP the rebuild (restorable on the stack)
+        close = function()
+            teardown_surface()
+            pending[sk] = nil -- FORGET the rebuild → is_alive false → dropped from the stack
+            live[sk] = nil
+            entry_keys[sk] = nil
+        end,
+        is_alive = function()
+            return pending[sk] ~= nil
+        end,
+        focus = function()
+            local st = live[sk]
+            if not st then
+                return
+            end
+            -- The fzf backend registers its own `dock_focus` (re-enter the fzf terminal list) via the dock
+            -- hooks; the tint backend has none, so fall back to focusing its INPUT band (or the container).
+            if st.dock_focus then
+                pcall(st.dock_focus)
+                return
+            end
+            local w = st.input_buf and vim.fn.bufwinid(st.input_buf) or -1
+            if w == -1 and st.st and st.st.container_win and api.nvim_win_is_valid(st.st.container_win) then
+                w = st.st.container_win
+            end
+            if w ~= -1 and api.nvim_win_is_valid(w) then
+                pcall(api.nvim_set_current_win, w)
+            end
+        end,
+        buffers = function()
+            return kind_buffers(sk)
+        end,
+        is_current = function()
+            local cur = api.nvim_get_current_win()
+            for _, w in ipairs(kind_windows(sk)) do
+                if w == cur then
+                    return true
+                end
+            end
+            return false
+        end,
+    }
+    consumers[sk] = c
+    return c
+end
+
 ---@class LvimPickerOpts
 ---@field items? any[]  STATIC candidates (strings, or tables — see `format`), fuzzy-filtered as you type
 ---@field source? fun(query: string, cb: fun(items: any[]))  a LIVE source: each query produces the results (e.g. ripgrep); use instead of `items`
@@ -213,7 +465,6 @@ end
 ---@field preview? fun(item: any): string[], string?, integer?  preview lines (+ a filetype, + a 1-based focus line) per selection
 ---@field preview_file? boolean  preview the item's REAL file buffer (EDITABLE, 2-way synced) instead of `preview` lines; items need `path` (+ lnum/col)
 ---@field preview_side? "right"|"left"|"below"|"above"|"dynamic"|"hide"  where the preview sits (default "right"); below/above stack; `dynamic` = full-width list + a peek float above (native-qf style); `hide` = no preview (toggle with <C-e>)
----@field preview_heights? table  managed dock heights `{ horizontal, vertical }`
 ---@field preview_numbers? boolean  show line numbers in the preview (default true)
 ---@field preview_wrap? boolean  soft-wrap the preview (default false)
 ---@field list_wrap? boolean  soft-wrap the list rows (no "↳" marker) so far-right matches stay visible (default false)
@@ -232,20 +483,32 @@ end
 ---@field max_rows? integer  natural list/preview height hint (default 15)
 ---@field layout? "float"|"bottom"|"area"  centred float (default), a bottom dock, or the cmdheight area (heirline above)
 ---@field height? integer  rows for the bottom layout (default 16)
+---@field key? string  the dock KIND key — this finder's stable identity in the dock stack (id = "lvim-picker:"..key); nil ⇒ derived from the title, else un-managed
+---@field dock_stack? boolean  PER-CALL override of the picker's own `config.dock.dock_stack` for THIS open: true = managed stack consumer, false = geometry-only standalone. nil ⇒ inherit `config.dock.dock_stack`. Caller plugins (lvim-lsp, lvim-qf-loc) opening THROUGH the picker set this to control docking for their entry.
+---@field force? { float?: table, area?: table, bottom?: table }  PER-CALL anchored geometry override (per layout), deep-merged over the central dock geometry AND `config.dock.force`; wins for THIS open. Each layout may carry height/height_auto/backdrop/auto_hide/keep_focus (float ALSO width/width_auto; area/bottom are always full-width). `opts.height` still wins as an explicit rows size.
 
---- Open a fuzzy finder: a centred float with a query input on top, a results list and (with `preview`) a
---- scrollable preview beside it. INSERT prompt: type to filter (fzf), `<C-j>/<C-k>` move, `<C-d>/<C-u>`
---- scroll the preview, `<CR>` confirms, `<C-c>` cancels, `<Esc>`/`<C-f>` → NORMAL. NORMAL list: `j`/`k`
---- move, `<C-d>/<C-u>` scroll preview, `<C-l>`/`<C-h>` panel nav, filter hotkeys, `q` close, `/` → typing.
+--- Actually CONSTRUCT + open a finder surface (the real work behind `M.open`): a centred float with a query
+--- input on top, a results list and (with `preview`) a scrollable preview beside it. When `kind` is given the
+--- open is MANAGED by the dock (which already parked the previous consumer, so we do NOT `close_active` here);
+--- when `kind` is nil it is un-managed — `source.close_active` replaces the previous finder in place. The
+--- (kind, layout) SLOT KEY (`sk`) — computed from `kind` + the resolved `opts.layout` — is what all managed
+--- open-state (`live[sk]` + the `dock.parked(entry_keys[sk])` bookkeeping) is filed under, so the SAME kind
+--- open in two layouts is two independent surfaces.
 ---@param opts LvimPickerOpts
-function M.open(opts)
+---@param kind string?  the dock kind (managed) or nil (un-managed)
+build = function(opts, kind)
     opts = opts or {}
     -- Default the LAYOUT from `config.layout` (default "area") when the caller gave none — so every
     -- finder + `:LvimPicker <finder>` lands in the configured layout unless overridden per call.
     opts.layout = opts.layout or (config or {}).layout or "area"
-    -- A finder already open (EITHER backend)? Close it FIRST via the shared registry so this open() replaces
-    -- it in place — its docked area is released, instead of a new finder stacking above the old one.
-    source.close_active()
+    -- The (kind, layout) slot key this managed open files its state under (nil ⇒ un-managed).
+    local sk = kind and slot_key(kind, opts.layout) or nil
+    -- UN-MANAGED only: a finder already open (EITHER backend)? Close it FIRST via the shared registry so this
+    -- open replaces it in place. In the MANAGED path the DOCK enforces one-visible-per-layout — it has already
+    -- PARKED the previous consumer (keeping it on the stack), so we must NOT destroy it here.
+    if not kind then
+        source.close_active()
+    end
     local surface = require("lvim-ui.surface")
     local items = normalize(opts.items, opts.format)
     local maxr = opts.max_rows or 15
@@ -949,7 +1212,6 @@ function M.open(opts)
     -- zone, so a global statusline (heirline) rises ABOVE it. Both bottom/area dock full-width borderless.
     local bottom = opts.layout == "bottom"
     local area = opts.layout == "area"
-    local docked = bottom or area
 
     -- (HOSTED area) An `area` finder homes in the msgarea zone via the surface engine's auto-host provider
     -- (position="cmdline" + no explicit host): the zone reserves rows above the messages, the surface follows
@@ -998,26 +1260,24 @@ function M.open(opts)
     else
         blocks = { list_block, preview_block }
     end
-    -- Size by layout × preview side. Docked: a list-only height, or a TALLER one when the preview is stacked
-    -- below/above (it grows up). Float: a wide two-pane, or a taller stacked one.
-    -- Docked layouts AUTO-fit their height to the result count (intelligent shrink/grow), capped so a huge
-    -- result set doesn't take the whole screen. Floats keep a fixed comfortable size.
-    local size
-    if docked then
-        -- The CONTENT (list/preview) is already capped at `max_rows`; the container cap adds the chrome
-        -- overhead (winbar + footer + air ≈ 4 rows) so the content can actually reach `max_rows`. The
-        -- area's own cmdheight clamp keeps it within the room available between the splits.
-        local cap = opts.height or (maxr + 4)
-        size = vertical and { height = { auto = true, max = 0.85 } } or { height = { auto = true, max = cap } }
-    else
-        -- FLOAT: honour `ui_config.size.float` (width / height fractions + their `*_auto` "fit-to-content"
-        -- flags) — no hardcoded per-orientation size, so the configured Float width/height are respected.
-        local f = (ui_config.size or {}).float or {}
-        local function axis(frac, auto)
-            frac = frac or 0.8
-            return auto and { auto = true, max = frac } or { fixed = frac }
-        end
-        size = { width = axis(f.width, f.width_auto), height = axis(f.height, f.height_auto) }
+    -- SLOT geometry (the float/area/bottom width + height) comes from the CENTRAL authority
+    -- (lvim-utils.config.dock.geometry → dock.slot): the surface derives it when we pass NO `size`, so the
+    -- picker no longer computes its own. `max_rows` still caps the LIST content height INSIDE the slot
+    -- (consumer-internal — not a duplicate size), and the preview side still rotates (C-n/C-p) — only the total
+    -- slot height is no longer picker-owned. FORCE — the effective per-layout anchored override: a per-call
+    -- `opts.force[layout]` wins, else the plugin's own `config.dock.force[layout]` (empty {} = inherit the central
+    -- geometry). Deep-copied so the `opts.height` rows-override (an EXPLICIT per-call size) can win on top. The
+    -- resolved slot (`{ height?, width?, height_auto?, width_auto? }`) is passed to the surface as its `slot`
+    -- override (wins over the shared geometry for this open only); its `backdrop` goes to the surface `backdrop`
+    -- seam below. area/bottom ignore width (full-width), so a forced width there is a no-op — as documented.
+    local eff_force = (opts.force and opts.force[opts.layout])
+        or ((config or {}).dock and config.dock.force and config.dock.force[opts.layout])
+    local slot_override = eff_force and vim.deepcopy(eff_force) or {}
+    if opts.height then
+        slot_override.height, slot_override.height_auto = opts.height, false
+    end
+    if not next(slot_override) then
+        slot_override = nil
     end
     -- Prompt badge (shared `config.prompt`): an icon and/or label on the STRONG tint, then a gap on
     -- the LIGHT input tint before the typed text. Two virt_text chunks so the badge and the gap carry their
@@ -1112,7 +1372,6 @@ function M.open(opts)
         header_air = false, -- no LEADING air row; the filter bar (or the input prompt) is the top content row
         direction = vertical and "vertical" or nil,
         preview_side = preview_provider and side or nil, -- so the surface can rotate the preview live (C-n/C-p)
-        preview_heights = preview_provider and (opts.preview_heights or pkcfg.preview_heights) or nil, -- { horizontal, vertical }
         lock_keys = true, -- modal list: only the bound keys act; every other key is a no-op (the editable preview is exempt)
         title = title_box, -- the chassis native centered border-title
         title_line = opts.title_line, -- title placement: "row" (default) | "statusline" (chassis overlay) | "border" (opt-in)
@@ -1124,7 +1383,12 @@ function M.open(opts)
         -- (`ui_config.separator`) BETWEEN the list and preview — auto-oriented, only at the gap, so a SINGLE
         -- panel (preview hidden / no preview) shows none.
         border = surface.FRAME_BORDER,
-        size = size,
+        -- No `size`: the surface derives the slot from the central geometry (dock.slot) when none is passed.
+        -- `slot` is the optional per-open anchored override (force + a rows `opts.height` for a docked layout).
+        slot = slot_override,
+        -- FORCE backdrop: the surface's own backdrop seam (merged over the central `dock.geometry.<layout>.backdrop`
+        -- inside dock.slot). nil = inherit the central default; a `force[layout].backdrop` table/false wins here.
+        backdrop = eff_force and eff_force.backdrop,
         header = {
             bars = (function()
                 local hb = {}
@@ -1232,10 +1496,35 @@ function M.open(opts)
                 pcall(api.nvim_del_augroup_by_id, state.live_augroup)
                 state.live_augroup = nil
             end
+            -- DOCK bookkeeping. A DOCK-DRIVEN teardown (`state.dock_teardown` — a park via `hide`, or a kill via
+            -- `close`) is silent: it must NOT re-notify the dock (it drove this) and must NOT forget the opts (a
+            -- park keeps them; `close` already cleared them). A SELF / EXTERNAL close (a confirm / cancel / `:q`)
+            -- means the finder is DONE — forget it and tell the dock to DROP the entry (without revealing another;
+            -- focus returns to the editor the finder opened from, so a confirm's own file-open lands there).
+            if sk then
+                if not state.dock_teardown then
+                    -- PARK + REMEMBER: a self / external close (confirm / cancel / q / :q, or replaced by
+                    -- another finder) KEEPS the remembered rebuild (`pending[sk]`) so the entry stays alive —
+                    -- cyclable with <Leader>n/p and listed in the <Leader>m menu — and only COLLAPSES the layout
+                    -- (no neighbour revealed, focus returns to the editor). Only `<Leader>x` (dock M.close →
+                    -- consumer.close) truly forgets the rebuild + drops the entry from the stack. Pass the STORED
+                    -- dock entry KEY (id, layout), not a reconstructed one.
+                    local d = get_dock()
+                    if d and entry_keys[sk] then
+                        pcall(d.parked, entry_keys[sk])
+                    end
+                end
+                if live[sk] == state then
+                    live[sk] = nil
+                end
+            end
         end,
     })
 
     source.set_active(active_entry) -- track THIS finder as the open one (its surface is now live)
+    if sk then
+        live[sk] = state -- expose the live surface to the dock consumer (buffers / focus / is_current / re-show)
+    end
 
     -- initial: show all, select the first, preview it (fetch + fit + render)
     rerender()
@@ -1317,10 +1606,144 @@ function M.open(opts)
     end
 end
 
+--- Route a finder-KIND open through the dock stack. MANAGED (the caller already resolved: dock manager present
+--- AND a stable key AND the effective `dock_stack` flag): remember the `rebuild` closure (the dock's `is_alive`
+--- reads it), refresh the consumer's live name / icon / layout / anchored `slot` (force) override, and
+--- SHOW-OR-CREATE it through the dock — which dedups by id and enforces one-visible-per-layout (parking any
+--- OTHER visible consumer there), then calls the consumer's `show`, which runs the rebuild. UN-MANAGED (no
+--- manager / no key / `dock_stack = false`): just run `rebuild()` (the classic replace-in-place). ONE layer for
+--- BOTH backends — only the rebuild differs (`build(opts, key)` for the tint list, `fzf.open(fzf_opts)` for the
+--- fzf TUI).
+---@param managed boolean  route through the dock stack (dock present AND `kind` AND the effective `dock_stack`)
+---@param kind string?    the dock kind (nil ⇒ un-managed)
+---@param layout string  the dock layout this kind occupies ("area"|"bottom"|"float")
+---@param meta { title?: string, icon?: string }  entry display name / glyph source (falls back to KIND_META)
+---@param rebuild fun()  (re)materialises this (kind, layout) slot's surface from its remembered opts (backend-specific)
+---@param slot? table  the consumer's anchored geometry (force) override for `dock.slot` (nil = inherit central)
+local function route(managed, kind, layout, meta, rebuild, slot)
+    local d = get_dock()
+    if managed and d and kind then
+        -- FILE the rebuild + open under the (kind, layout) slot key — so opening the SAME kind in another layout
+        -- is a SEPARATE entry with its own consumer / surface, and STORE the dock's returned entry key to pass
+        -- back to the lifecycle APIs.
+        local sk = slot_key(kind, layout)
+        pending[sk] = rebuild
+        local c = get_consumer(kind, layout) -- one consumer per (kind, layout); its `layout` is fixed at creation
+        local km = KIND_META[kind]
+        c.name = (meta and meta.title) or (km and km.name) or kind
+        c.icon = (meta and meta.icon) or (km and km.icon) or "󰍉"
+        c.slot = slot -- ANCHORED force override → do_show feeds it to dock.slot as ctx.rect
+        entry_keys[sk] = d.open(c) -- STORE the returned (id, layout) entry key for parked/refresh_leader/dropped
+    else
+        rebuild()
+    end
+end
+
+--- Open a fuzzy finder: a centred float with a query input on top, a results list and (with `preview`) a
+--- scrollable preview beside it. INSERT prompt: type to filter (fzf), `<C-j>/<C-k>` move, `<C-d>/<C-u>`
+--- scroll the preview, `<CR>` confirms, `<C-c>` cancels, `<Esc>`/`<C-f>` → NORMAL. NORMAL list: `j`/`k`
+--- move, `<C-d>/<C-u>` scroll preview, `<C-l>`/`<C-h>` panel nav, filter hotkeys, `q` close, `/` → typing.
+---
+--- Participates in the shared DOCK STACK (lvim-utils.dock) when present: each finder KIND is its own entry
+--- (`id = "lvim-picker:<kind>"`, keyed by `opts.key` — else a slug of the title), one visible per layout,
+--- cyclable with `<Leader>n`/`<Leader>p`, killable with `<Leader>x`, listed in the `<Leader>m` menu. Opening
+--- another kind in the same layout PARKS this one (restorable); re-opening a live kind rebuilds it fresh in
+--- place. Without the dock (or a resolvable key) it falls back to the classic replace-in-place open.
+---@param opts LvimPickerOpts
+function M.open(opts)
+    opts = opts or {}
+    opts.layout = opts.layout or (config or {}).layout or "area"
+    local key = resolve_key(opts)
+    -- Effective dock_stack: a per-call `opts.dock_stack` OVERRIDES the plugin's own `config.dock.dock_stack` for
+    -- THIS open (a caller plugin opening THROUGH the picker controls docking for its entry). nil ⇒ inherit config.
+    local stack = opts.dock_stack
+    if stack == nil then
+        stack = (config or {}).dock and config.dock.dock_stack
+    end
+    -- MANAGED only when the dock is present AND a key resolves AND the effective dock_stack is on — the rebuild
+    -- then passes that key to `build` (managed: skip close_active, register `live`, do the on_close dock
+    -- bookkeeping); un-managed passes nil (the classic `source.close_active` replace-in-place).
+    local managed = get_dock() ~= nil and key ~= nil and stack ~= false
+    -- The consumer's anchored force override for the stack path: per-call `opts.force[layout]` wins, else own
+    -- `config.dock.force[layout]` (empty {} = inherit). build recomputes the SAME for its surface slot either way.
+    local eff_force = (opts.force and opts.force[opts.layout])
+        or ((config or {}).dock and config.dock.force and config.dock.force[opts.layout])
+    route(managed, key, opts.layout, { title = opts.title, icon = opts.icon }, function()
+        build(opts, managed and key or nil)
+    end, eff_force)
+end
+
+--- Open a finder through the fzf-TUI backend MANAGED by the dock stack, exactly as `M.open` manages the tint
+--- list — so `:LvimPicker files` / `grep` / … participate in the dock stack under the DEFAULT `fzf_tui = true`
+--- config, not only the tint fallback. When managed it injects the dock hooks the fzf backend calls back
+--- through (register the live fzf surface on open; re-arm the leader owner after a keep-open restart;
+--- PARK+REMEMBER on a self/external close) and routes with a rebuild that re-invokes `fzf.open`. Un-managed (no
+--- manager / no key) it opens fzf in place (fzf's own `source.close_active` replace). ONE dock layer — the
+--- consumer contract is NOT duplicated into fzf.lua; the backend only reports its live state + self-close.
+---@param b table              the fzf backend (`require("lvim-picker.fzf")`)
+---@param fzf_opts LvimFzfOpts  the fully-built fzf finder spec (carries `key` + `title`)
+open_fzf = function(b, fzf_opts)
+    fzf_opts.layout = fzf_opts.layout or (config or {}).layout or "area"
+    local key = resolve_key(fzf_opts)
+    -- Effective dock_stack: a per-call `fzf_opts.dock_stack` overrides the plugin's own `config.dock.dock_stack`.
+    local stack = fzf_opts.dock_stack
+    if stack == nil then
+        stack = (config or {}).dock and config.dock.dock_stack
+    end
+    local managed = get_dock() ~= nil and key ~= nil and stack ~= false
+    if managed then
+        ---@cast key string  `managed` implies `key ~= nil` (LS can't narrow it across the `and` on its own)
+        -- The (kind, layout) slot this fzf open files its live state / dock bookkeeping under — so `files` in
+        -- float and `files` in bottom are two independent fzf surfaces / dock entries.
+        local sk = slot_key(key, fzf_opts.layout)
+        -- The dock hooks fzf.open calls back through: `on_open` hands us the live surface `state` (so the
+        -- consumer's buffers / focus / is_current read it, and `hide` can park it) + wires its `dock_focus`
+        -- (re-enter the fzf terminal list); `on_restart` re-installs the leader owner (by the STORED entry key)
+        -- after a keep-open restart swaps the terminal buffer; `on_close` (run inside fzf's surface on_close)
+        -- MIRRORS the tint bookkeeping — a dock-driven teardown (park/close, flagged `dock_teardown`) is silent,
+        -- a self/external close (confirm/cancel/:q) PARKS + REMEMBERS the entry (keeps `pending[sk]`,
+        -- `d.parked`s it by the stored key → stays alive / cyclable / in the menu, collapses the layout, focus
+        -- returns to the editor). Only `<Leader>x` drops it.
+        fzf_opts.dock = {
+            on_open = function(state)
+                state.dock_focus = function()
+                    if state.st and state.st.focus_block then
+                        pcall(state.st.focus_block, "list")
+                    end
+                end
+                live[sk] = state
+            end,
+            on_restart = function()
+                local d = get_dock()
+                if d and d.refresh_leader and entry_keys[sk] then
+                    d.refresh_leader(entry_keys[sk])
+                end
+            end,
+            on_close = function(state)
+                if not state.dock_teardown then
+                    local d = get_dock()
+                    if d and entry_keys[sk] then
+                        pcall(d.parked, entry_keys[sk])
+                    end
+                end
+                if live[sk] == state then
+                    live[sk] = nil
+                end
+            end,
+        }
+    end
+    local eff_force = (fzf_opts.force and fzf_opts.force[fzf_opts.layout])
+        or ((config or {}).dock and config.dock.force and config.dock.force[fzf_opts.layout])
+    route(managed, key, fzf_opts.layout, { title = fzf_opts.title, icon = fzf_opts.icon }, function()
+        b.open(fzf_opts)
+    end, eff_force)
+end
+
 --- A ready finder over the listed buffers; confirming switches to the chosen buffer, with a content preview.
 ---@param opts? table  forwarded to M.open
 function M.buffers(opts)
     opts = opts or {}
+    opts.key = opts.key or "buffers"
     local items = {}
     for _, b in ipairs(api.nvim_list_bufs()) do
         if vim.bo[b].buflisted then
@@ -1354,32 +1777,35 @@ function M.buffers(opts)
         for _, it in ipairs(items) do
             contents[#contents + 1] = ("%d\t%s%s"):format(it.bufnr, source.file_icon(it.text), it.text)
         end
-        fb.open(vim.tbl_extend("force", {
-            title = "Buffers",
-            contents = contents,
-            fzf_args = { "--delimiter=\t", "--with-nth=2" },
-            parse = function(line)
-                local bufnr, name = line:match("^(%d+)\t(.*)$")
-                name = name and source.strip_icon(name) or line -- drop the leading coloured ft icon
-                bufnr = tonumber(bufnr)
-                -- The display `name` is the `:~:.` form, which is NOT a usable path (`~` is unexpanded, and it
-                -- is cwd-relative) — so preview/quickfix must carry the ABSOLUTE path, resolved from the buffer
-                -- (like oldfiles does). "[No Name]" buffers stay text-only.
-                local abs = (bufnr and api.nvim_buf_is_valid(bufnr)) and api.nvim_buf_get_name(bufnr) or ""
-                if abs == "" and name ~= "[No Name]" then
-                    abs = vim.fn.fnamemodify(name, ":p")
-                end
-                return { bufnr = bufnr, text = name, path = (abs ~= "") and abs or nil }
-            end,
-            preview = function(it)
-                return buf_preview(it.bufnr, it.path or it.text or "")
-            end,
-            on_confirm = function(it)
-                if it and it.bufnr and api.nvim_buf_is_valid(it.bufnr) then
-                    api.nvim_set_current_buf(it.bufnr)
-                end
-            end,
-        }, opts))
+        open_fzf(
+            fb,
+            vim.tbl_extend("force", {
+                title = "Buffers",
+                contents = contents,
+                fzf_args = { "--delimiter=\t", "--with-nth=2" },
+                parse = function(line)
+                    local bufnr, name = line:match("^(%d+)\t(.*)$")
+                    name = name and source.strip_icon(name) or line -- drop the leading coloured ft icon
+                    bufnr = tonumber(bufnr)
+                    -- The display `name` is the `:~:.` form, which is NOT a usable path (`~` is unexpanded, and it
+                    -- is cwd-relative) — so preview/quickfix must carry the ABSOLUTE path, resolved from the buffer
+                    -- (like oldfiles does). "[No Name]" buffers stay text-only.
+                    local abs = (bufnr and api.nvim_buf_is_valid(bufnr)) and api.nvim_buf_get_name(bufnr) or ""
+                    if abs == "" and name ~= "[No Name]" then
+                        abs = vim.fn.fnamemodify(name, ":p")
+                    end
+                    return { bufnr = bufnr, text = name, path = (abs ~= "") and abs or nil }
+                end,
+                preview = function(it)
+                    return buf_preview(it.bufnr, it.path or it.text or "")
+                end,
+                on_confirm = function(it)
+                    if it and it.bufnr and api.nvim_buf_is_valid(it.bufnr) then
+                        api.nvim_set_current_buf(it.bufnr)
+                    end
+                end,
+            }, opts)
+        )
         return
     end
     M.open(vim.tbl_extend("force", {
@@ -1418,26 +1844,30 @@ end
 ---@param opts? table
 function M.files(opts)
     opts = opts or {}
+    opts.key = opts.key or "files" -- dock kind key (tint/managed path); the fzf backend ignores it
     local b = fzf_backend()
     if b then
         -- fzf runs `file_list_cmd()` as its producer (FZF_DEFAULT_COMMAND) and owns the list; we keep the
         -- real-Neovim preview + the open action.
-        b.open(vim.tbl_extend("force", {
-            title = "Files",
-            cmd = source.with_icons(file_list_cmd()),
-            parse = function(line)
-                return { path = source.strip_icon(line) }
-            end,
-            fzf_args = { "--nth", "2.." }, -- fuzzy-match the path, not the leading coloured icon
-            preview = function(it)
-                return read_preview(it.path)
-            end,
-            on_confirm = function(it)
-                if it and it.path then
-                    vim.cmd.edit(vim.fn.fnameescape(it.path))
-                end
-            end,
-        }, opts))
+        open_fzf(
+            b,
+            vim.tbl_extend("force", {
+                title = "Files",
+                cmd = source.with_icons(file_list_cmd()),
+                parse = function(line)
+                    return { path = source.strip_icon(line) }
+                end,
+                fzf_args = { "--nth", "2.." }, -- fuzzy-match the path, not the leading coloured icon
+                preview = function(it)
+                    return read_preview(it.path)
+                end,
+                on_confirm = function(it)
+                    if it and it.path then
+                        vim.cmd.edit(vim.fn.fnameescape(it.path))
+                    end
+                end,
+            }, opts)
+        )
         return
     end
     M.open(vim.tbl_extend("force", {
@@ -1470,24 +1900,28 @@ end
 ---@param opts? table
 function M.directories(opts)
     opts = opts or {}
+    opts.key = opts.key or "directories"
     local b = fzf_backend()
     if b then
-        b.open(vim.tbl_extend("force", {
-            title = "Directories",
-            cmd = source.with_dir_icon(dir_list_cmd()),
-            parse = function(line)
-                return { path = source.strip_icon(line) }
-            end,
-            fzf_args = { "--nth", "2.." }, -- match the path, not the leading folder icon
-            preview = function(it)
-                return run_lines({ "ls", "-A", it.path }), ""
-            end,
-            on_confirm = function(it)
-                if it and it.path then
-                    vim.cmd.cd(vim.fn.fnameescape(it.path))
-                end
-            end,
-        }, opts))
+        open_fzf(
+            b,
+            vim.tbl_extend("force", {
+                title = "Directories",
+                cmd = source.with_dir_icon(dir_list_cmd()),
+                parse = function(line)
+                    return { path = source.strip_icon(line) }
+                end,
+                fzf_args = { "--nth", "2.." }, -- match the path, not the leading folder icon
+                preview = function(it)
+                    return run_lines({ "ls", "-A", it.path }), ""
+                end,
+                on_confirm = function(it)
+                    if it and it.path then
+                        vim.cmd.cd(vim.fn.fnameescape(it.path))
+                    end
+                end,
+            }, opts)
+        )
         return
     end
     M.open(vim.tbl_extend("force", {
@@ -1519,6 +1953,7 @@ end
 ---@param opts? table
 function M.grep(opts)
     opts = opts or {}
+    opts.key = opts.key or "grep" -- a fixed-query variant (cword / …) sets its own key BEFORE calling here
     if not has("rg") then
         vim.notify("lvim-picker.grep needs ripgrep (rg)", vim.log.levels.WARN)
         return
@@ -1565,7 +2000,7 @@ function M.grep(opts)
         else
             backend.reload = source.grep_reload(opts.regex, opts.file) -- live grep (opts.file → curbuf only)
         end
-        b.open(vim.tbl_extend("force", backend, opts))
+        open_fzf(b, vim.tbl_extend("force", backend, opts))
         return
     end
     --- Parse one ripgrep `--vimgrep` stdout line into a location item (`path:lnum:col:text`).
@@ -1645,6 +2080,7 @@ end
 ---@param opts? table
 function M.grep_cword(opts)
     opts = opts or {}
+    opts.key = opts.key or "grep_cword"
     opts.query = opts.query or vim.fn.expand("<cword>")
     opts.title = opts.title or ("Grep: " .. opts.query)
     return M.grep(opts)
@@ -1654,6 +2090,7 @@ end
 ---@param opts? table
 function M.grep_cWORD(opts)
     opts = opts or {}
+    opts.key = opts.key or "grep_cWORD"
     opts.query = opts.query or vim.fn.expand("<cWORD>")
     opts.title = opts.title or ("Grep: " .. opts.query)
     return M.grep(opts)
@@ -1663,6 +2100,7 @@ end
 ---@param opts? table
 function M.grep_visual(opts)
     opts = opts or {}
+    opts.key = opts.key or "grep_visual"
     local s, e = vim.fn.getpos("'<"), vim.fn.getpos("'>")
     local lines = vim.fn.getline(s[2], e[2])
     if #lines > 0 then
@@ -1678,6 +2116,7 @@ end
 ---@param opts? table
 function M.grep_word(opts)
     opts = opts or {}
+    opts.key = opts.key or "grep_word"
     require("lvim-ui").input({
         prompt = "Grep",
         callback = function(confirmed, q)
@@ -1693,6 +2132,7 @@ end
 ---@param opts? table
 function M.grep_curbuf(opts)
     opts = opts or {}
+    opts.key = opts.key or "grep_curbuf"
     local file = api.nvim_buf_get_name(0)
     if file == "" or vim.fn.filereadable(file) ~= 1 then
         vim.notify("lvim-picker.grep_curbuf: current buffer has no file on disk", vim.log.levels.WARN)
@@ -1706,6 +2146,8 @@ end
 --- Fuzzy finder over RECENT files (`v:oldfiles`, readable only), newest first; confirming edits the file.
 ---@param opts? table
 function M.oldfiles(opts)
+    opts = opts or {}
+    opts.key = opts.key or "oldfiles"
     local items, seen = {}, {}
     for _, p in ipairs(vim.v.oldfiles or {}) do
         if not seen[p] and vim.fn.filereadable(p) == 1 then
@@ -1732,6 +2174,8 @@ end
 --- Fuzzy finder over HELP tags; confirming opens that help topic.
 ---@param opts? table
 function M.help_tags(opts)
+    opts = opts or {}
+    opts.key = opts.key or "help_tags"
     local items = {}
     for _, t in ipairs(vim.fn.getcompletion("", "help")) do
         items[#items + 1] = { text = t, tag = t }
@@ -1753,6 +2197,7 @@ end
 ---@param opts? table
 function M.git_files(opts)
     opts = opts or {}
+    opts.key = opts.key or "git_files"
     local inside = run_lines({ "git", "rev-parse", "--is-inside-work-tree" })[1]
     if inside ~= "true" then
         vim.notify("lvim-picker.git_files: not inside a git work tree", vim.log.levels.WARN)
@@ -1760,22 +2205,25 @@ function M.git_files(opts)
     end
     local b = fzf_backend()
     if b then
-        b.open(vim.tbl_extend("force", {
-            title = "Git files",
-            cmd = source.with_icons({ "git", "ls-files" }),
-            parse = function(line)
-                return { path = source.strip_icon(line) }
-            end,
-            fzf_args = { "--nth", "2.." }, -- fuzzy-match the path, not the leading coloured icon
-            preview = function(it)
-                return read_preview(it.path)
-            end,
-            on_confirm = function(it)
-                if it and it.path then
-                    vim.cmd.edit(vim.fn.fnameescape(it.path))
-                end
-            end,
-        }, opts))
+        open_fzf(
+            b,
+            vim.tbl_extend("force", {
+                title = "Git files",
+                cmd = source.with_icons({ "git", "ls-files" }),
+                parse = function(line)
+                    return { path = source.strip_icon(line) }
+                end,
+                fzf_args = { "--nth", "2.." }, -- fuzzy-match the path, not the leading coloured icon
+                preview = function(it)
+                    return read_preview(it.path)
+                end,
+                on_confirm = function(it)
+                    if it and it.path then
+                        vim.cmd.edit(vim.fn.fnameescape(it.path))
+                    end
+                end,
+            }, opts)
+        )
         return
     end
     M.open(vim.tbl_extend("force", {
@@ -1806,6 +2254,8 @@ end
 --- scheme on cancel so browsing is non-destructive.
 ---@param opts? table
 function M.colorschemes(opts)
+    opts = opts or {}
+    opts.key = opts.key or "colorschemes"
     local current = vim.g.colors_name
     local items = {}
     for _, c in ipairs(vim.fn.getcompletion("", "color")) do
@@ -1832,6 +2282,8 @@ end
 --- rather than running it blindly.
 ---@param opts? table
 function M.commands(opts)
+    opts = opts or {}
+    opts.key = opts.key or "commands"
     local items = {}
     for _, c in ipairs(vim.fn.getcompletion("", "command")) do
         items[#items + 1] = { text = c, cmd = c }
@@ -1881,6 +2333,8 @@ end
 --- Fuzzy finder over MARKS (`:marks`); confirming jumps to the mark, with a preview at its line.
 ---@param opts? table
 function M.marks(opts)
+    opts = opts or {}
+    opts.key = opts.key or "marks"
     local items = {}
     for _, m in ipairs(vim.fn.getmarklist()) do -- global marks (A–Z, 0–9, …)
         local p = vim.fn.fnamemodify(m.file or "", ":~:.")
@@ -1912,6 +2366,8 @@ end
 --- description.
 ---@param opts? table
 function M.keymaps(opts)
+    opts = opts or {}
+    opts.key = opts.key or "keymaps"
     local items = {}
     for _, mode in ipairs({ "n", "i", "v", "x", "o", "c", "t" }) do
         for _, k in ipairs(vim.api.nvim_get_keymap(mode)) do
@@ -1941,6 +2397,8 @@ end
 --- Fuzzy finder over the QUICKFIX list; confirming jumps to the entry, with a preview at its line.
 ---@param opts? table
 function M.quickfix(opts)
+    opts = opts or {}
+    opts.key = opts.key or "quickfix"
     local items = {}
     for _, e in ipairs(vim.fn.getqflist()) do
         local p = e.bufnr ~= 0 and vim.fn.fnamemodify(api.nvim_buf_get_name(e.bufnr), ":~:.") or ""
@@ -1963,6 +2421,8 @@ end
 --- Fuzzy finder over the JUMPLIST (newest first); confirming jumps to the location, with a preview.
 ---@param opts? table
 function M.jumplist(opts)
+    opts = opts or {}
+    opts.key = opts.key or "jumplist"
     local jumps = vim.fn.getjumplist()[1] or {}
     local items = {}
     for i = #jumps, 1, -1 do -- newest first

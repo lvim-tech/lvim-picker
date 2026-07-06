@@ -5,8 +5,13 @@
 --
 ---@module "lvim-picker.config"
 
+---@class LvimPickerDock
+---@field dock_stack      boolean  Managed dock-STACK consumer (cyclable, one-visible-per-layout) vs geometry-only standalone
+---@field force           table    Per-layout ANCHORED geometry overrides ({ float, area, bottom }) deep-merged over the central dock geometry
+
 ---@class LvimPickerConfig
 ---@field layout          string   Default layout for every finder: "area" | "float" | "bottom"
+---@field dock            LvimPickerDock  This plugin's OWN docking defaults (namespaced): dock_stack + per-layout force geometry
 ---@field fzf_tui         boolean  Use the real fzf TUI for heavy command-driven finders (false = the Lua tint list)
 ---@field keys            table    All finder keys (accept / mark / quickfix / preview scroll / park / abort / nav)
 ---@field marker          string   The mark indicator glyph drawn before a marked row (multi-select)
@@ -20,7 +25,6 @@
 ---@field caret           table    The input caret (hl group + guicursor shape)
 ---@field hl              table    Highlight groups for every finder element (all overridable)
 ---@field preview         table    The preview winbar (devicon toggle + path pads)
----@field preview_heights table    Area height per preview-stack direction (horizontal / vertical)
 ---@field empty_text      string   Text shown when there are no results
 ---@field empty_preview   string   The preview placeholder text when nothing is focused
 ---@field list_wrap       boolean  Soft-wrap the list rows instead of truncating long matches
@@ -31,6 +35,22 @@ return {
     -- "area" (the cmdheight/msgarea zone — the modern default) | "float" (a centred float) | "bottom" (a
     -- bottom dock). A per-call `opts.layout` (or a `:LvimPicker <finder> <layout>` arg) overrides it.
     layout = "area",
+
+    -- This plugin's OWN docking defaults, NAMESPACED under `dock` (matching lvim-dependencies'
+    -- `config.dock.dock_stack` / `config.dock.force`). Per-call `opts.dock_stack` / `opts.force`
+    -- still override these for a single open.
+    dock = {
+        -- true = full dock-STACK consumer (managed: cyclable <Leader>n/p/x/m, :LvimDock,
+        -- one-visible-per-layout, no overlap); false = geometry-only (central dock.slot size/
+        -- backdrop, opens standalone, NOT in the stack). A per-call `opts.dock_stack` overrides this.
+        dock_stack = true,
+        -- Per-plugin per-layout ANCHORED geometry overrides, deep-merged per field OVER the global
+        -- `lvim-utils.config.dock.geometry.<layout>`; empty {} = inherit the global unchanged. Each
+        -- layout may carry: height, height_auto, backdrop = { enabled, mode, dim = { amount },
+        -- darken = { amount } }, auto_hide, keep_focus. FLOAT ALSO: width, width_auto. area/bottom
+        -- are ALWAYS full-width — NO width/width_auto (ignored if set). A per-call `opts.force` overrides this.
+        force = { float = {}, area = {}, bottom = {} },
+    },
 
     -- RENDERER for the heavy, command-driven finders (files / grep / git_files / directories / buffers):
     -- `true` (default) = the real fzf TUI runs inside the finder's list panel (fzf — in C — owns parsing,
@@ -61,7 +81,7 @@ return {
         -- is in normal mode, so bare letters are safe) and an INSERT key (`i`, a Ctrl chord — plain keys type
         -- into the query). Routed through fzf `--expect`; the consumer's `on_confirm` opens the item in the
         -- window the method prepared. In an area/bottom dock the finder STAYS open afterwards (restarted in place,
-        -- no flicker) per `the lvim-ui size.<layout>.auto_hide` / `keep_focus`.
+        -- no flicker) per the central `lvim-utils.config.dock.geometry.<layout>.auto_hide` / `keep_focus`.
         open_methods = {
             edit = { n = "<CR>", i = "<C-CR>" }, -- the window the picker was opened from
             vsplit = { n = "v", i = "<C-v>" }, -- a vertical split
@@ -187,17 +207,6 @@ return {
         show_icon = true, -- show the file's devicon before the name (needs nvim-web-devicons)
         dir_pad_left = 1, -- spaces before the path
         dir_pad_right = 1, -- spaces after the path
-    },
-
-    -- (area / docked layouts WITH a preview) The area's HEIGHT for each preview-stack direction — shared by
-    -- EVERY finder (diagnostics, files, grep, the qf browser …): `horizontal` when the preview sits side-by-side
-    -- (left/right), `vertical` when it is stacked (above/below — usually taller so both panels get room). A
-    -- value ≤ 1 is a fraction of the screen height; > 1 an absolute row count. `<C-n>` / `<C-p>` rotate the
-    -- preview through the four sides live and switch between these two heights. A per-call `opts.preview_heights`
-    -- overrides (e.g. the qf browser's `config.browser.height`).
-    preview_heights = {
-        horizontal = 0.33,
-        vertical = 0.66,
     },
 
     -- Shown when there are NO results — in the list body AND in the preview's winbar (where the file name

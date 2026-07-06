@@ -20,7 +20,6 @@
 local api = vim.api
 local uv = vim.uv
 local config = require("lvim-picker.config")
-local ui_config = require("lvim-ui.config")
 local colors = require("lvim-utils.colors")
 local highlight = require("lvim-utils.highlight")
 local cursor = require("lvim-utils.cursor")
@@ -251,7 +250,6 @@ end
 ---@field title_line? string  title placement: "row" (a top content row, default) | "statusline" (the centralized chrome overlay) | "border" (opt-in native border-title)
 ---@field counter? string  match-count placement: "footer" (default — the bottom-right border) | "title" (folded into the border-title)
 ---@field preview_side? string  where the preview panel sits: "right" (default) | "left" | "above" | "below"
----@field preview_heights? table  managed dock heights `{ horizontal, vertical }`
 ---@field cmd? string[]  the producer argv (FZF_DEFAULT_COMMAND): fzf runs + streams it (files / dirs / git)
 ---@field contents? string[]  a STATIC candidate list (e.g. buffers) — fed to fzf via a temp file
 ---@field reload? string  a shell command with a literal `{q}` placeholder (grep): fzf RE-RUNS it per keystroke
@@ -266,6 +264,10 @@ end
 ---@field layout? "float"|"bottom"|"area"
 ---@field height? integer  rows for the docked layouts
 ---@field max_rows? integer  list/preview height (default 15)
+---@field key? string  the dock KIND key — this finder's stable identity in the dock stack (id = "lvim-picker:"..key); nil ⇒ derived from the title, else un-managed
+---@field dock_stack? boolean  PER-CALL override of `config.dock.dock_stack` (managed stack consumer vs geometry-only standalone); nil ⇒ inherit config
+---@field force? { float?: table, area?: table, bottom?: table }  PER-CALL anchored geometry override (per layout), deep-merged over the central geometry AND `config.dock.force`; `opts.height` still wins as an explicit rows size
+---@field dock? { on_open: fun(state: table), on_close: fun(state: table), on_restart?: fun() }  dock-stack hooks set by the picker when this open is MANAGED by lvim-utils.dock: `on_open` hands the live surface `state` to the manager (so it can park / focus / read its buffers); `on_close` (run in the surface on_close) does the manager's bookkeeping (silent for a dock-driven park/close via `dock_teardown`, PARK+REMEMBER for a self/external close); `on_restart` re-arms the leader owner after a keep-open restart swaps the terminal buffer. Absent ⇒ un-managed (fzf owns `source.close_active` replace-in-place).
 
 --- Open the fzf-TUI finder.
 ---@param opts LvimFzfOpts
@@ -276,9 +278,14 @@ function M.open(opts)
     -- docked finder still open and hands focus to some OTHER window (e.g. the first one). Capturing it after that
     -- made "open in split" split the wrong window (the reported bug); the invoking window is the current one now.
     local opener = api.nvim_get_current_win()
-    -- Close whatever finder is open (EITHER backend, via the shared registry) so this one replaces it in
-    -- place — its docked area is released first, instead of a new finder stacking above the old one.
-    source.close_active()
+    -- MANAGED by the dock stack (`opts.dock` present)? The dock enforces one-visible-per-layout and has already
+    -- PARKED the previous consumer (kept restorable), so we must NOT close_active (destroy) it — mirroring the
+    -- tint backend's managed path. UN-MANAGED: close whatever finder is open (EITHER backend, via the shared
+    -- registry) so this one replaces it in place — its docked area is released first, instead of stacking above.
+    local managed = opts.dock ~= nil
+    if not managed then
+        source.close_active()
+    end
 
     -- List/preview row cap. DOCKED (area/bottom) stays compact (15). FLOAT sizes the cap to the CONFIGURED
     -- float height so a full result set fills it up to `ui_config.size.float.height` — a fixed 15 left an
@@ -291,8 +298,9 @@ function M.open(opts)
     if opts.max_rows then
         maxr = opts.max_rows
     elseif opts.layout == "float" then
-        local fh = ((ui_config.size or {}).float or {}).height or 0.8
-        local target = fh <= 1 and math.floor(vim.o.lines * fh) or math.floor(fh)
+        -- Fill the list up to the CENTRAL float slot height (config.dock.geometry.float.height via dock.slot),
+        -- so a full result set reaches the configured float height. The slot is already resolved to rows.
+        local target = require("lvim-utils.dock").slot("float").height
         maxr = math.max(5, target - 5)
     else
         maxr = 15
@@ -694,8 +702,9 @@ function M.open(opts)
         -- never close → no flicker) and keep or drop focus per `keep_focus`. A cancel or the quickfix key falls
         -- through to the normal close path.
         local lay = opts.layout
-        local lcfg = (ui_config.size or {})[lay] or {}
-        local keep_open = (lay == "area" or lay == "bottom") and not lcfg.auto_hide and #items > 0 and method ~= "qf"
+        -- `auto_hide` / `keep_focus` come from the CENTRAL geometry (config.dock.geometry.<layout> via dock.slot).
+        local lslot = require("lvim-utils.dock").slot(lay)
+        local keep_open = (lay == "area" or lay == "bottom") and not lslot.auto_hide and #items > 0 and method ~= "qf"
         if keep_open then
             do_open()
             local pan = state.list_pan
@@ -718,7 +727,7 @@ function M.open(opts)
                 end
                 -- Restore the pre-open MODE so the fresh fzf's WinEnter honours it (normal → no startinsert).
                 state.normal = was_normal
-                if lcfg.keep_focus ~= false and api.nvim_win_is_valid(pan.win) then
+                if lslot.keep_focus ~= false and api.nvim_win_is_valid(pan.win) then
                     api.nvim_set_current_win(pan.win)
                     if was_normal then
                         -- opened FROM normal-on-list → stay there: cursor hidden (fzf selection is the focus), j/k
@@ -727,6 +736,12 @@ function M.open(opts)
                     else
                         vim.cmd("startinsert")
                     end
+                end
+                -- MANAGED: the restart swapped the fzf terminal buffer (the old one was deleted above), so
+                -- re-install the dock leader owner on the fresh buffer set — otherwise <Leader>n/p/x/m would
+                -- silently stop working in the kept-open finder.
+                if managed and opts.dock.on_restart then
+                    pcall(opts.dock.on_restart)
                 end
             end
             return
@@ -1252,7 +1267,6 @@ function M.open(opts)
     -- ── layout (mirror the tint picker's surface wiring) ──
     local bottom = opts.layout == "bottom"
     local area = opts.layout == "area"
-    local docked = bottom or area
 
     -- BOTH data panels — the LIST and the PREVIEW — carry the single-source content ring (`surface.CONTENT_BORDER`,
     -- resolved live to `ui_config.content_border`), matching the tint backend so the two look identical. The fzf
@@ -1271,19 +1285,20 @@ function M.open(opts)
     local preview_block = preview_provider and { id = "preview", provider = preview_provider, border = pbord }
     local blocks = preview_block and { list_block, preview_block } or { list_block }
 
-    local size
-    if docked then
-        local cap = opts.height or (maxr + 4)
-        size = { height = { auto = true, max = cap } }
-    else
-        -- FLOAT: honour `ui_config.size.float` (width / height fractions + their `*_auto` "fit-to-content"
-        -- flags) — no hardcoded size, so the configured Float width/height/auto-resize are respected.
-        local f = (ui_config.size or {}).float or {}
-        local function axis(frac, auto)
-            frac = frac or 0.8
-            return auto and { auto = true, max = frac } or { fixed = frac }
-        end
-        size = { width = axis(f.width, f.width_auto), height = axis(f.height, f.height_auto) }
+    -- SLOT geometry (float/area/bottom width + height) comes from the CENTRAL authority
+    -- (lvim-utils.config.dock.geometry → dock.slot): the surface derives it when we pass NO `size`. `max_rows`
+    -- still caps the list content INSIDE the slot. FORCE — the effective per-layout anchored override: a per-call
+    -- `opts.force[layout]` wins, else the plugin's own `config.dock.force[layout]` (empty {} = inherit). Deep-copied so
+    -- the `opts.height` rows-override (an EXPLICIT per-call size) can win on top; its `backdrop` goes to the
+    -- surface `backdrop` seam below. area/bottom ignore width (full-width), so a forced width there is a no-op.
+    local eff_force = (opts.force and opts.force[opts.layout])
+        or ((config or {}).dock and config.dock.force and config.dock.force[opts.layout])
+    local slot_override = eff_force and vim.deepcopy(eff_force) or {}
+    if opts.height then
+        slot_override.height, slot_override.height_auto = opts.height, false
+    end
+    if not next(slot_override) then
+        slot_override = nil
     end
 
     -- footer — MODE-AWARE + grouped, generated from the CONFIGURED keys (never hardcoded), so it always shows
@@ -1359,10 +1374,15 @@ function M.open(opts)
         -- own CONTENT_BORDER ring; the chassis draws the configurable inter-panel divider (`ui_config.separator`)
         -- BETWEEN the list and preview — auto-oriented, only at the gap, so a SINGLE panel shows none.
         border = surface.FRAME_BORDER,
-        size = size,
-        -- so the surface can rotate the preview (C-n/C-p) + switch the dock height per stack direction
+        -- No `size`: the surface derives the slot from the central geometry (dock.slot) when none is passed.
+        -- `slot` is the optional per-open anchored override (force + a rows `opts.height` for a docked layout).
+        slot = slot_override,
+        -- FORCE backdrop: the surface's own backdrop seam (merged over the central geometry backdrop in dock.slot).
+        -- nil = inherit the central default; a `force[layout].backdrop` table/false wins here.
+        backdrop = eff_force and eff_force.backdrop,
+        -- so the surface can rotate the preview (C-n/C-p) — the POSITION rotates; the total slot height is
+        -- central now, no longer per-preview-orientation.
         preview_side = preview_provider and (opts.preview_side or "right") or nil,
-        preview_heights = preview_provider and (opts.preview_heights or (config or {}).preview_heights) or nil,
         -- No CONTENT title row — the title + counter are the chassis border-title / border-counter now; the
         -- fzf terminal panel IS the prompt, so there are no header bands.
         content = { blocks = blocks },
@@ -1408,10 +1428,24 @@ function M.open(opts)
             end) -- idempotent: drop the chrome-overlay title/counter if `title_line="statusline"` published it
             -- (the surface engine releases its own auto-host msgarea reserve on close — nothing to do here)
             source.clear_active(active_entry)
+            -- MANAGED: dock bookkeeping (mirrors the tint backend). A dock-driven teardown (a park via `hide` or
+            -- a kill via `close`, flagged `state.dock_teardown`) is silent — it must NOT re-notify the dock. A
+            -- self / external close (a confirm / cancel / `:q`) PARKS + REMEMBERS the entry (keeps its rebuild →
+            -- stays cyclable / in the menu) and only collapses the layout so focus returns to the editor.
+            if managed and opts.dock.on_close then
+                pcall(opts.dock.on_close, state)
+            end
         end,
     })
 
     source.set_active(active_entry)
+
+    -- MANAGED: hand the live surface `state` to the dock manager (so the consumer's buffers / focus /
+    -- is_current read it, and `hide` can park it). Done AFTER surface.open, so `state.st` + the panels (and the
+    -- terminal buffer created by the list provider's `update`) are already wired onto `state`.
+    if managed and opts.dock.on_open then
+        pcall(opts.dock.on_open, state)
+    end
 
     -- Focus the fzf list (terminal) through the chassis' own focus API, so it grabs focus the same way the
     -- tint picker's input band does; the WinEnter autocmd then enters terminal-mode. Scheduled so the surface

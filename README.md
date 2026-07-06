@@ -43,9 +43,72 @@ require("lvim-picker").setup({})
 
 ```lua
 local pick = require("lvim-picker")
-pick.files()       pick.grep()      pick.buffers()    pick.oldfiles()
-pick.git_files()   pick.help_tags() pick.marks()      pick.quickfix()
-pick.directories() pick.keymaps()   pick.commands()   pick.colorschemes()
+pick.files()
+pick.grep()
+pick.buffers()
+pick.oldfiles()
+pick.git_files()
+pick.help_tags()
+pick.marks()
+pick.quickfix()
+pick.directories()
+pick.keymaps()
+pick.commands()
+pick.colorschemes()
+```
+
+## Dock stack
+
+When **lvim-utils** provides the shared dock-stack manager, every opened finder KIND is an entry in the
+dock stack — `files`, `grep`, `buffers` … each with the base identity `lvim-picker:<kind>`, so `:LvimPicker files`
+and `:LvimPicker grep` are two distinct instances. This applies to **both** finder backends: the fzf-TUI finders
+(the default `fzf_tui = true`) and the Lua tint list — the two dock through one layer. Only one is visible per
+layout at a time: opening a second finder there PARKS the first (its finder spec is remembered — it stays
+restorable on the stack), and re-opening a live kind rebuilds it fresh in place (no duplicate).
+
+The dock keys every entry by **(kind, layout)**, so the same finder can be docked in more than one layout at
+once — `files` in the `float` stack **and** the `bottom` stack **and** the `area` stack are three independent
+entries, each with its own surface (present in multiple stacks simultaneously). Re-opening the same `(kind, layout)`
+re-shows that one entry (never a duplicate in that stack); opening the same kind in a different layout is a
+separate entry there.
+
+Closing a finder the ordinary way — confirming, cancelling, `q` / `<Esc>` / `:q`, or opening another finder
+over it — **parks and remembers** it: focus returns to the editor and the layout collapses, but the entry
+stays on the stack (still cyclable and listed in the menu), so you can bring it back later. Only `<Leader>x`
+actually kills an entry.
+
+The dock keys (from lvim-utils.dock) apply while a finder is focused:
+
+- `<Leader>n` / `<Leader>p` — cycle the visible finder forward / back through the current layout's stack;
+- `<Leader>x` — kill the visible finder and reveal the next one on the stack;
+- `<Leader>m` — a menu of every live (parked or visible) dock consumer (finders, terminal, …) across all layouts.
+
+Without the dock manager (an older lvim-utils) the picker falls back to the classic "one finder open at a
+time" behaviour — opening a finder replaces the previous one in place.
+
+### Per-call docking (programmatic callers)
+
+`config.dock.dock_stack` / `config.dock.force` are the picker's OWN defaults for the direct `:LvimPicker`
+finders. A plugin opening a finder **through** the picker (e.g. `lvim-lsp`, `lvim-qf-loc`) can override them
+**per call** on the `opts` passed to `require("lvim-picker").open(opts)` (and the built-in `files` / `grep` /
+… helpers):
+
+- `opts.dock_stack` (boolean) — override `config.dock.dock_stack` for THIS open only. `true` = managed stack
+  consumer, `false` = geometry-only standalone; `nil` = inherit the config. So a caller can dock its finder
+  into the stack (or keep it standalone) regardless of the picker's own default.
+- `opts.force` (`{ float = {…}, area = {…}, bottom = {…} }`) — per-call anchored geometry override, same shape
+  as `config.dock.force`, deep-merged over the central geometry (and winning over `config.dock.force`) for
+  THIS open. `opts.height` (explicit rows) still wins over a forced height. area/bottom stay full-width
+  (width ignored).
+
+```lua
+require("lvim-picker").open({
+    title = "References",
+    items = locations,
+    on_confirm = jump,
+    dock_stack = true, -- dock this finder into the shared stack for this call
+    force = { area = { height = 0.4 } }, -- and force its area height to 40%
+})
 ```
 
 ## Configuration
@@ -57,6 +120,20 @@ engine's config); it is optional (the defaults below work as-is). The full defau
 require("lvim-picker").setup({
     -- Default layout for every finder: "area" (message zone) | "float" (centred) | "bottom" (dock).
     layout = "area",
+    -- This plugin's OWN docking defaults, namespaced under `dock` (per-call opts.dock_stack / opts.force
+    -- still override these for a single open).
+    dock = {
+        -- true = full dock-STACK consumer (managed: cyclable <Leader>n/p/x/m, :LvimDock, one-visible-per-layout);
+        -- false = geometry-only (central size/backdrop, opens standalone, NOT in the stack). A per-call
+        -- opts.dock_stack overrides this (see below).
+        dock_stack = true,
+        -- Per-layout ANCHORED geometry overrides, deep-merged per field OVER the global
+        -- lvim-utils.config.dock.geometry.<layout>; empty {} = inherit unchanged. Each layout may carry:
+        -- height, height_auto, backdrop = { enabled, mode, dim = { amount }, darken = { amount } }, auto_hide,
+        -- keep_focus. float ALSO: width, width_auto. area/bottom are always full-width (width ignored). A
+        -- per-call opts.force overrides this (see below).
+        force = { float = {}, area = {}, bottom = {} },
+    },
     -- Real fzf TUI for the heavy command-driven finders (false = the Lua tint list). Needs fzf + mkfifo.
     fzf_tui = true,
     -- All finder keys (a value is a single key or a list; "" / {} disables it).
