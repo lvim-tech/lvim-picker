@@ -18,7 +18,7 @@
 ---@module "lvim-picker.fzf"
 
 local api = vim.api
-local uv = vim.uv or vim.loop
+local uv = vim.uv
 local config = require("lvim-picker.config")
 local ui_config = require("lvim-ui.config")
 local colors = require("lvim-utils.colors")
@@ -32,11 +32,17 @@ local NS = api.nvim_create_namespace("lvim-utils-fzf-preview")
 
 local M = {}
 
---- True when this backend can run: the `fzf` binary is on PATH, `vim.system` exists (async producers) and
---- `mkfifo` is available (the focus→preview channel). Callers fall back to the tint picker otherwise.
+-- The MINIMUM fzf version (major*100+min) this backend's fixed flag set needs to run: `--gutter=` landed in
+-- fzf 0.64 (`--input-border` ~0.59, `--highlight-line` 0.53 are older). On anything below, fzf exits with
+-- "unknown option" (code 2), which reads as a silent cancel — so `available()` gates on it and callers fall
+-- back to the tint backend instead of flashing an empty picker open and dying.
+local MIN_FZF = 64
+
+--- True when this backend can run: the `fzf` binary is on PATH and NEW ENOUGH for its flag set (>= 0.64),
+--- and `mkfifo` is available (the focus→preview channel). Callers fall back to the tint picker otherwise.
 ---@return boolean
 function M.available()
-    return source.has("fzf") and type(vim.system) == "function" and source.has("mkfifo")
+    return source.has("fzf") and source.fzf_version() >= MIN_FZF and source.has("mkfifo")
 end
 
 -- ─── theming: the live palette → fzf `--color` ────────────────────────────────
@@ -302,6 +308,11 @@ function M.open(opts)
 
     local state = {
         closed = false,
+        -- The outcome was already delivered (a confirm/cancel via `finish`, or a per-call row action owns it):
+        -- on_close must NOT then ALSO fire on_cancel. When it is still false at close time the finder was
+        -- dismissed EXTERNALLY (replaced by the next finder via the shared registry, or a surface-owned close)
+        -- with no choice — which counts as a cancel, so on_close delivers on_cancel (e.g. colorschemes restores).
+        handled = false,
         normal = false, -- NORMAL mode on the list: <Esc> left fzf's input, j/k drive fzf via chansend
         st = nil,
         list_pan = nil,
@@ -354,13 +365,21 @@ function M.open(opts)
     end
     local function file_rows()
         local it = state.cur_item
-        if it and it.path and it.path ~= "" and vim.fn.filereadable(it.path) == 1 then
-            -- Count lines with `readfile` (first `maxr` only) — NEVER `bufadd`+`bufload`: loading the real file
-            -- buffer fires its FileType autocmds → the LSP attaches to every focused file → "install missing
-            -- server" prompts, spurious diagnostics, and the autocmd cascade that pops the quickfix open. We
-            -- only need the row count for the preview height, and reading the file gives it with no buffer.
-            local ok, lines = pcall(vim.fn.readfile, it.path, "", maxr)
-            return ok and math.max(1, #lines) or 1
+        if it and it.path and it.path ~= "" then
+            -- Reuse the line count `render_preview` already computed for THIS path (it reads the file to build
+            -- the preview) — the focused file was otherwise read twice per focus event (once here for the panel
+            -- height, once in render_preview for the content).
+            if state.preview_cache and state.preview_cache.path == it.path then
+                return math.max(1, math.min(state.preview_cache.count, maxr))
+            end
+            if vim.fn.filereadable(it.path) == 1 then
+                -- No cached preview yet (a size query before the first render) → count lines with `readfile`
+                -- (first `maxr` only). NEVER `bufadd`+`bufload`: loading the real file buffer fires its FileType
+                -- autocmds → the LSP attaches to every focused file → "install missing server" prompts, spurious
+                -- diagnostics, and the autocmd cascade that pops the quickfix open. The row count needs no buffer.
+                local ok, lines = pcall(vim.fn.readfile, it.path, "", maxr)
+                return ok and math.max(1, #lines) or 1
+            end
         end
         return 1
     end
@@ -436,10 +455,16 @@ function M.open(opts)
     end
     local park_key = keylist(kcfg.park)[1] or ""
     local qf_key = keylist(kcfg.quickfix)[1] -- the one key that accepts-into-quickfix (via fzf --expect)
-    --- Drop the transient return-map (idempotent).
+    --- Drop the transient return-map (idempotent) and RESTORE whatever global normal-mode mapping the park key
+    --- had before park shadowed it (snapshotted in `park`), so a user's own `<C-o>` (or whatever the park key is)
+    --- survives a park/return cycle instead of being deleted for the session.
     local function clear_park_map()
         if state.parked and park_key ~= "" then
             pcall(vim.keymap.del, "n", park_key)
+            if state.saved_park_map and not vim.tbl_isempty(state.saved_park_map) then
+                pcall(vim.fn.mapset, "n", false, state.saved_park_map)
+            end
+            state.saved_park_map = nil
         end
         state.parked = false
     end
@@ -458,6 +483,9 @@ function M.open(opts)
         vim.cmd("stopinsert")
         api.nvim_set_current_win(opener)
         if park_key ~= "" then
+            -- snapshot the user's own global mapping on the park key (a dict, `{}` when none) so clear_park_map
+            -- can restore it after the return, rather than leaving the key stripped.
+            state.saved_park_map = vim.fn.maparg(park_key, "n", false, true)
             vim.keymap.set("n", park_key, unpark, { nowait = true, silent = true, desc = "Return to the finder" })
         end
     end
@@ -501,6 +529,11 @@ function M.open(opts)
             local pl, pf, fo = opts.preview(item)
             lines = (type(pl) == "table" and pl) or (pl and { tostring(pl) }) or { "" }
             ft, focus = pf, fo
+        end
+        -- Cache the line count for THIS path so `file_rows` (the panel-height query, fired right after via
+        -- refit) reuses it instead of re-reading the file.
+        if item.path and item.path ~= "" then
+            state.preview_cache = { path = item.path, count = #lines }
         end
         -- Fresh buffer per previewed file so the treesitter highlighter can switch languages as you scroll
         -- (a reused buffer caches one parser/language). Still WITHOUT a `filetype` → no FileType → no LSP
@@ -616,6 +649,7 @@ function M.open(opts)
         if state.closed then
             return
         end
+        state.handled = true -- finish OWNS the outcome (it fires on_confirm or on_cancel itself below)
         -- Remember the MODE the file was opened FROM (normal-on-list vs insert query), so a keep-open dock returns
         -- to the SAME mode after the restart instead of always dropping into insert.
         local was_normal = state.normal
@@ -753,8 +787,10 @@ function M.open(opts)
         if opts.preview and state.fifo then
             -- 2-row grep: `{}` is the whole record (location row + `\n` + indented text row); the preview only
             -- needs the LOCATION row, so emit just its first line — else the fifo reader sees the text row and
-            -- `parse` fails (preview shows "[unreadable]").
-            local emit = (opts.multiline and opts.multiline > 0) and "echo {} | head -n1" or "echo {}"
+            -- `parse` fails (preview shows "[unreadable]"). `printf '%s\n'` (not `echo`) so a `\` in a path is
+            -- emitted VERBATIM — dash's `echo` interprets backslash escapes and would mangle such filenames.
+            local emit = (opts.multiline and opts.multiline > 0) and "printf '%s\\n' {} | head -n1"
+                or "printf '%s\\n' {}"
             local w = ("%s > %s"):format(emit, shellesc(state.fifo.path))
             args[#args + 1] = "--bind=focus:execute-silent(" .. w .. ")"
         end
@@ -829,6 +865,12 @@ function M.open(opts)
             end
             return table.concat(parts, " ")
         elseif opts.contents then
+            -- A keep-open dock RESTARTS fzf in place, re-running producer_env each time; remove the PREVIOUS
+            -- contents temp file before minting a new one so a long-lived docked finder does not leak one per
+            -- restart (on_close only ever deletes the last).
+            if state.contents_file then
+                os.remove(state.contents_file)
+            end
             local f = vim.fn.tempname()
             local fh = io.open(f, "w")
             if fh then
@@ -891,7 +933,10 @@ function M.open(opts)
         end
         local cmdline = build_fzf_cmdline()
         api.nvim_win_call(pan.win, function()
-            state.term_chan = vim.fn.termopen({ "sh", "-c", cmdline }, {
+            -- `jobstart(..., { term = true })` — the 0.12 replacement for the deprecated `termopen`; identical
+            -- semantics (the current buffer, `tbuf`, becomes the terminal) run inside this `nvim_win_call`.
+            state.term_chan = vim.fn.jobstart({ "sh", "-c", cmdline }, {
+                term = true,
                 env = env,
                 on_exit = function(_, code)
                     local lines = {}
@@ -1090,6 +1135,7 @@ function M.open(opts)
                     with_handoff(function()
                         action.run(state.cur_item, function()
                             state.closed = true -- the impending fzf on_exit finish() then no-ops (no on_cancel)
+                            state.handled = true -- the action owns the outcome → on_close must not fire on_cancel
                             if state.st then
                                 pcall(state.st.close)
                             end
@@ -1260,13 +1306,20 @@ function M.open(opts)
     -- `surface.core_footer_item`. A per-call row action (`opts.keys`) registers under its own `name`.
     local REG = {
         open = { key = klabel(kcfg.accept), name = "open" },
-        vsplit = { n = klabel(om.vsplit.n), i = klabel(om.vsplit.i), name = "vsplit" },
-        hsplit = { n = klabel(om.hsplit.n), i = klabel(om.hsplit.i), name = "hsplit" },
         move = { n = "j/k", i = move_i, name = "move" },
         mark = { key = klabel(kcfg.mark), name = "mark" },
         qf = { key = klabel(kcfg.quickfix), name = "qf" },
         close = { n = klabel(kcfg.abort) .. "/q", i = klabel(kcfg.abort), name = "close" },
     }
+    -- open-method entries only when the method is a real `{ n, i }` table (a user may disable one by
+    -- overriding it to false / a string) — indexing `om.vsplit.n` unconditionally crashed on such overrides,
+    -- exactly the guard the binding loop above already applies.
+    for _, m in ipairs({ "vsplit", "hsplit" }) do
+        local sp = om[m]
+        if type(sp) == "table" then
+            REG[m] = { n = klabel(sp.n), i = klabel(sp.i), name = m }
+        end
+    end
     if opts.preview then
         REG.preview = { key = klabel(kcfg.preview_down) .. "/u", name = "preview" }
     end
@@ -1320,6 +1373,12 @@ function M.open(opts)
         close_keys = {},
         on_close = function()
             state.closed = true
+            -- Dismissed externally (replaced by the next finder, or a surface-owned close) with no confirm /
+            -- cancel / row action having run → treat it as a cancel so restore-on-cancel finders (colorschemes)
+            -- are not silently skipped.
+            if not state.handled and opts.on_cancel then
+                pcall(opts.on_cancel)
+            end
             clear_park_map() -- drop the transient return-map if the finder closed while parked
             if state.term_buf then -- drop the custom input caret registration (the cursor module restores normal)
                 pcall(cursor.mark_cursor_buffer, state.term_buf, nil)

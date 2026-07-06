@@ -28,6 +28,15 @@ local read_preview = source.read_preview
 local run_lines = source.run_lines
 local spawn_stream = source.spawn_stream
 
+--- How many lines a location/grep preview must read to always include the FOCUS line: the default 500 cap
+--- plus a screenful of context below it, so a match DEEP in a large file previews at the right spot instead of
+--- clamping to line 500 (the focus is otherwise `min(lnum, 500)`).
+---@param lnum integer?
+---@return integer
+local function preview_span(lnum)
+    return math.max(500, (lnum or 0) + 200)
+end
+
 --- The fzf-TUI backend for the heavy / command-driven finders (files / grep / git_files / directories /
 --- buffers), or nil when it is disabled (`config.fzf_tui == false`) or unavailable (no fzf / mkfifo).
 --- When present, those finders let the real fzf TUI own the list (instant over huge trees, continuous live
@@ -93,10 +102,13 @@ local function normalize(items, format)
     local out = {}
     for i, it in ipairs(items or {}) do
         if type(it) == "string" then
-            out[i] = { text = it, _src = it }
+            -- collapse any embedded newlines ONCE here (not later in list_row) so the fuzzy MATCH indices and
+            -- the RENDERED row are computed against the SAME single-line string — otherwise a multiline text
+            -- shifts the highlighted spans.
+            out[i] = { text = (it:gsub("[\r\n]+", " ")), _src = it }
         else
             local item = {
-                text = (format and format(it)) or it.text or tostring(it),
+                text = (tostring((format and format(it)) or it.text or tostring(it)):gsub("[\r\n]+", " ")),
                 icon = it.icon,
                 icon_hl = it.icon_hl,
                 _src = it,
@@ -167,7 +179,9 @@ end
 local function list_row(it, marked, dot)
     local lead = marked and dot or " "
     local icon = (it.icon and it.icon ~= "") and (it.icon .. " ") or ""
-    local text = (it.text or ""):gsub("[\r\n]+", " ")
+    -- `it.text` is already single-line (collapsed in `normalize`), so the match spans below (computed on the
+    -- SAME string) stay aligned with what is drawn.
+    local text = it.text or ""
     local row = lead .. icon .. text
     local spans = {}
     if it.match and #it.match > 0 then
@@ -175,8 +189,12 @@ local function list_row(it, marked, dot)
         local nch = vim.fn.strchars(text)
         for _, ci in ipairs(it.match) do
             if ci >= 0 and ci < nch then
-                spans[#spans + 1] =
-                    { c0 = base + vim.str_byteindex(text, ci), c1 = base + vim.str_byteindex(text, ci + 1) }
+                -- `it.match` holds codepoint (utf-32) indices; convert each to a BYTE offset via the 0.12
+                -- `str_byteindex(str, encoding, index)` signature (the old positional form is deprecated).
+                spans[#spans + 1] = {
+                    c0 = base + vim.str_byteindex(text, "utf-32", ci),
+                    c1 = base + vim.str_byteindex(text, "utf-32", ci + 1),
+                }
             end
         end
     end
@@ -188,7 +206,8 @@ end
 ---@field source? fun(query: string, cb: fun(items: any[]))  a LIVE source: each query produces the results (e.g. ripgrep); use instead of `items`
 ---@field stream? fun(feed: fun(raw: any[]), done: fun()): fun()  an ASYNC streaming producer (e.g. `fd`): feeds candidates in incrementally; returns a cancel fn
 ---@field on_confirm fun(item: any)  called with the chosen item's source value
----@field on_cancel? fun()  called when the finder is dismissed without a choice
+---@field on_cancel? fun()  called when the finder is dismissed without a choice (incl. replaced by the next finder)
+---@field on_close? fun()  finder-owned teardown run on close (e.g. a live source killing its in-flight process)
 ---@field format? fun(item: any): string  display text for a table item (default: `item.text`)
 ---@field preview? fun(item: any): string[], string?, integer?  preview lines (+ a filetype, + a 1-based focus line) per selection
 ---@field preview_file? boolean  preview the item's REAL file buffer (EDITABLE, 2-way synced) instead of `preview` lines; items need `path` (+ lnum/col)
@@ -236,6 +255,10 @@ function M.open(opts)
         preview_pan = nil,
         st = nil,
         closed = false,
+        -- The outcome was already delivered (confirm / cancel / a row action). While this stays false at close
+        -- time the finder was dismissed externally (replaced by the next finder), which on_close treats as a
+        -- cancel — so restore-on-cancel finders (colorschemes) still fire.
+        handled = false,
         query = "",
         marked = {},
     }
@@ -808,11 +831,32 @@ function M.open(opts)
             -- STATIC list: narrow by the active filter bars FIRST, then fuzzy-filter the survivors.
             local pool = items
             if filters then
-                pool = {}
-                for _, it in ipairs(items) do
-                    if passes_filters(it._src) then
-                        pool[#pool + 1] = it
+                -- The narrowed pool depends ONLY on the item set + which filter buttons are active, NEVER on the
+                -- query. Rebuilding it (a NEW table) on every keystroke invalidated the reference-keyed candidate
+                -- caches (`_texts_cache` here + fuzzy's file cache) → a full fzf temp-file rewrite per keypress.
+                -- Cache it keyed by the item set (ref + length, so a refresh/stream growth rebuilds) and the
+                -- active-button ids, so a pure query change REUSES the same pool table (caches stay warm).
+                local parts = {}
+                for _, g in ipairs(filters) do
+                    parts[#parts + 1] = tostring(g.active)
+                end
+                local key = table.concat(parts, "|")
+                if
+                    state.filter_pool
+                    and state.filter_pool_src == items
+                    and state.filter_pool_len == #items
+                    and state.filter_pool_key == key
+                then
+                    pool = state.filter_pool
+                else
+                    pool = {}
+                    for _, it in ipairs(items) do
+                        if passes_filters(it._src) then
+                            pool[#pool + 1] = it
+                        end
                     end
+                    state.filter_pool, state.filter_pool_src, state.filter_pool_len, state.filter_pool_key =
+                        pool, items, #items, key
                 end
             end
             filter(pool, state.query, function(list)
@@ -847,6 +891,7 @@ function M.open(opts)
     end
     confirm = function()
         local it = state.filtered[state.sel]
+        state.handled = true -- we own the outcome → on_close must not also fire on_cancel
         if state.st then
             state.st.close()
         end
@@ -857,6 +902,7 @@ function M.open(opts)
     -- Dismiss the finder (no choice). Shared by the prompt (<C-c>) and NORMAL-mode list (q / <Esc>).
     cancel = function()
         vim.cmd("stopinsert")
+        state.handled = true -- deliver on_cancel HERE (not again from on_close)
         if state.st then
             state.st.close()
         end
@@ -892,6 +938,7 @@ function M.open(opts)
             marked[#marked + 1] = s
         end
         run(it._src, function()
+            state.handled = true -- the row action owns the outcome → on_close must not fire on_cancel
             if state.st then
                 state.st.close()
             end
@@ -1159,6 +1206,15 @@ function M.open(opts)
         close_keys = {}, -- the input owns <Esc>/<C-c>; the panels are not normally focused
         on_close = function()
             state.closed = true
+            -- Dismissed externally (replaced by the next finder via the shared registry, or a surface-owned
+            -- close) with no confirm / cancel / row action having run → treat it as a cancel so restore-on-cancel
+            -- finders (e.g. colorschemes) are not silently skipped. `confirm`/`cancel`/`act` set `state.handled`.
+            if not state.handled and opts.on_cancel then
+                pcall(opts.on_cancel)
+            end
+            if opts.on_close then -- a finder's own teardown hook (e.g. live grep killing its in-flight rg)
+                pcall(opts.on_close)
+            end
             pcall(function()
                 require("lvim-hud.overlay").clear()
             end) -- idempotent: drop the chrome-overlay title/counter if `title_line="statusline"` published it
@@ -1306,13 +1362,18 @@ function M.buffers(opts)
             parse = function(line)
                 local bufnr, name = line:match("^(%d+)\t(.*)$")
                 name = name and source.strip_icon(name) or line -- drop the leading coloured ft icon
-                -- a real file name doubles as the preview `path` (drives the devicon winbar); "[No Name]" stays
-                -- text-only.
-                local path = (name ~= "[No Name]") and name or nil
-                return { bufnr = tonumber(bufnr), text = name, path = path }
+                bufnr = tonumber(bufnr)
+                -- The display `name` is the `:~:.` form, which is NOT a usable path (`~` is unexpanded, and it
+                -- is cwd-relative) — so preview/quickfix must carry the ABSOLUTE path, resolved from the buffer
+                -- (like oldfiles does). "[No Name]" buffers stay text-only.
+                local abs = (bufnr and api.nvim_buf_is_valid(bufnr)) and api.nvim_buf_get_name(bufnr) or ""
+                if abs == "" and name ~= "[No Name]" then
+                    abs = vim.fn.fnamemodify(name, ":p")
+                end
+                return { bufnr = bufnr, text = name, path = (abs ~= "") and abs or nil }
             end,
             preview = function(it)
-                return buf_preview(it.bufnr, it.text or "")
+                return buf_preview(it.bufnr, it.path or it.text or "")
             end,
             on_confirm = function(it)
                 if it and it.bufnr and api.nvim_buf_is_valid(it.bufnr) then
@@ -1467,9 +1528,14 @@ function M.grep(opts)
     -- layout and by `\n    text` in the fzf-lua 2-row layout, so the match stops right after the col number.
     local function parse_grep(line)
         line = source.strip_icon(line) -- drop the leading coloured ft icon (+ any ANSI) before parsing
-        local file, lnum, col = line:match("^(.-):(%d+):(%d+)")
+        -- The record is either the 1-row `path:lnum:col:text` or the fzf-lua 2-row `path:lnum:col\n    text`.
+        -- Split off the second row FIRST so its embedded newline (and indent) never reach the quickfix text;
+        -- parse the location from the header, and keep the matched text as the trimmed remainder.
+        local head, tail = line:match("^([^\n]*)\n%s*(.*)$")
+        head = head or line
+        local file, lnum, col, rest = head:match("^(.-):(%d+):(%d+):?(.*)$")
         if file then
-            return { path = file, lnum = tonumber(lnum), col = tonumber(col), text = line }
+            return { path = file, lnum = tonumber(lnum), col = tonumber(col), text = tail or rest or "" }
         end
         return { path = line, text = line }
     end
@@ -1482,7 +1548,7 @@ function M.grep(opts)
             parse = parse_grep,
             multiline = source.fzf_multiline(), -- fzf-lua 2-row layout (location row + indented text row)
             preview = function(it)
-                local lines, ft = read_preview(it.path)
+                local lines, ft = read_preview(it.path, preview_span(it.lnum))
                 return lines, ft, it.lnum -- focus the matched line
             end,
             on_confirm = function(it)
@@ -1503,37 +1569,24 @@ function M.grep(opts)
         b.open(vim.tbl_extend("force", backend, opts))
         return
     end
-    M.open(vim.tbl_extend("force", {
+    --- Parse one ripgrep `--vimgrep` stdout line into a location item (`path:lnum:col:text`).
+    ---@param line string
+    ---@return table?
+    local function rg_item(line)
+        local file, lnum, col, text = line:match("^(.-):(%d+):(%d+):(.*)$")
+        if file then
+            return {
+                text = ("%s:%s  %s"):format(file, lnum, text),
+                path = file,
+                lnum = tonumber(lnum),
+                col = tonumber(col),
+            }
+        end
+    end
+    local tint = {
         title = "Grep",
-        source = function(query, cb)
-            if query == nil or #query < 2 then -- wait for a couple of chars (rg over a huge tree is heavy)
-                cb({})
-                return
-            end
-            -- ripgrep argv from the shared source layer: matches the query LITERALLY unless `opts.regex`, and
-            -- shares the file-source config so CONTENT search matches what `files` LISTS (hidden / .gitignore /
-            -- the excluded dirs).
-            local rg = source.grep_cmd(query, opts.regex)
-            vim.system(rg, { text = true }, function(res)
-                vim.schedule(function()
-                    local out = {}
-                    for line in (res.stdout or ""):gmatch("[^\n]+") do
-                        local file, lnum, col, text = line:match("^(.-):(%d+):(%d+):(.*)$")
-                        if file then
-                            out[#out + 1] = {
-                                text = ("%s:%s  %s"):format(file, lnum, text),
-                                path = file,
-                                lnum = tonumber(lnum),
-                                col = tonumber(col),
-                            }
-                        end
-                    end
-                    cb(out)
-                end)
-            end)
-        end,
         preview = function(it)
-            local lines, ft = read_preview(it.path)
+            local lines, ft = read_preview(it.path, preview_span(it.lnum))
             return lines, ft, it.lnum -- focus the preview on the matched line
         end,
         on_confirm = function(it)
@@ -1543,7 +1596,50 @@ function M.grep(opts)
                 vim.cmd("normal! zz")
             end
         end,
-    }, opts or {}))
+    }
+    if opts.query and opts.query ~= "" then
+        -- FIXED-query grep (cword / cWORD / selection / prompt): rg runs ONCE, then the matches are
+        -- fuzzy-filtered as static items — mirroring the fzf static branch. The live `source` below only reacts
+        -- to the TYPED query, so without this a word-under-cursor grep would open with an EMPTY list.
+        local static = {}
+        for _, line in ipairs(run_lines(source.grep_cmd(opts.query, opts.regex))) do
+            static[#static + 1] = rg_item(line)
+        end
+        tint.items = static
+    else
+        -- LIVE grep: each query re-runs `rg`. Keep the in-flight handle so a fast typist does not pile up a
+        -- stack of whole-tree scans — the previous rg is killed before the next spawns (and on close).
+        local grep_handle
+        local function kill_grep()
+            if grep_handle then
+                pcall(function()
+                    grep_handle:kill("sigterm")
+                end)
+                grep_handle = nil
+            end
+        end
+        tint.source = function(query, cb)
+            kill_grep()
+            if query == nil or #query < 2 then -- wait for a couple of chars (rg over a huge tree is heavy)
+                cb({})
+                return
+            end
+            -- ripgrep argv from the shared source layer: matches the query LITERALLY unless `opts.regex`, and
+            -- shares the file-source config so CONTENT search matches what `files` LISTS (hidden / .gitignore /
+            -- the excluded dirs).
+            grep_handle = vim.system(source.grep_cmd(query, opts.regex), { text = true }, function(res)
+                vim.schedule(function()
+                    local out = {}
+                    for line in (res.stdout or ""):gmatch("[^\n]+") do
+                        out[#out + 1] = rg_item(line)
+                    end
+                    cb(out)
+                end)
+            end)
+        end
+        tint.on_close = kill_grep -- kill any in-flight rg when the finder closes
+    end
+    M.open(vim.tbl_extend("force", tint, opts))
 end
 
 --- Grep the word under the cursor (`<cword>`), then fuzzy-filter the matches.
@@ -1774,11 +1870,11 @@ end
 ---@return string[] lines, string filetype, integer? focus
 local function preview_location(it)
     if it.path and it.path ~= "" then
-        local lines, ft = read_preview(it.path)
+        local lines, ft = read_preview(it.path, preview_span(it.lnum))
         return lines, ft, it.lnum
     end
     if it.bufnr and api.nvim_buf_is_loaded(it.bufnr) then
-        return api.nvim_buf_get_lines(it.bufnr, 0, 500, false), vim.bo[it.bufnr].filetype, it.lnum
+        return api.nvim_buf_get_lines(it.bufnr, 0, preview_span(it.lnum), false), vim.bo[it.bufnr].filetype, it.lnum
     end
     return { "[no preview]" }, "", nil
 end

@@ -205,7 +205,7 @@ function M.filter(texts, query, cb)
         return
     end
     local bin = fzf_path()
-    if not bin or type(vim.system) ~= "function" or not path then
+    if not bin or not path then
         deliver(lua_rank(texts, query))
         return
     end

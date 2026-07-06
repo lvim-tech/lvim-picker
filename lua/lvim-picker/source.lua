@@ -388,12 +388,33 @@ local function rg_color_flags()
     return flags
 end
 
+---@type integer? cached fzf version as `major*100 + minor` (0 = fzf absent / unparseable)
+local fzf_ver
+
+--- The installed fzf version as `major*100 + minor` (e.g. 0.64 → 64, 0.53 → 53), or 0 when fzf is not on
+--- PATH / its `--version` cannot be parsed. Probed (and cached) once — the SINGLE version probe shared by the
+--- multiline gate here and the fzf-TUI backend's `available()` (which needs a flag set new enough to run).
+---@return integer
+function M.fzf_version()
+    if fzf_ver ~= nil then
+        return fzf_ver
+    end
+    if not M.has("fzf") then
+        fzf_ver = 0
+        return fzf_ver
+    end
+    local ok, ver = pcall(vim.fn.systemlist, { "fzf", "--version" })
+    local maj, min = ((ok and ver[1]) or ""):match("(%d+)%.(%d+)")
+    fzf_ver = (maj and tonumber(maj) * 100 + tonumber(min)) or 0
+    return fzf_ver
+end
+
 ---@type integer? cached effective grep multiline level
 local fzf_ml
 
 --- The EFFECTIVE grep multiline level (0 = off): `config.grep_multiline` capped to what fzf supports —
 --- the fzf-lua 2-row grep layout uses `--read0`/`--print0`/`--gap`, which need fzf >= 0.53, so on older fzf it
---- silently falls back to the 1-row grep. Probed (and cached) once.
+--- silently falls back to the 1-row grep. Cached once.
 ---@return integer
 function M.fzf_multiline()
     if fzf_ml ~= nil then
@@ -404,9 +425,7 @@ function M.fzf_multiline()
         fzf_ml = 0
         return fzf_ml
     end
-    local ok, ver = pcall(vim.fn.systemlist, { "fzf", "--version" })
-    local maj, min = ((ok and ver[1]) or ""):match("(%d+)%.(%d+)")
-    fzf_ml = (maj and tonumber(maj) * 100 + tonumber(min) >= 53) and want or 0
+    fzf_ml = (M.fzf_version() >= 53) and want or 0
     return fzf_ml
 end
 
@@ -481,13 +500,14 @@ function M.read_preview(path, n)
     return { "[unreadable]" }, ""
 end
 
---- Run an argv synchronously and return its stdout lines (empty on failure).
+--- Run an argv synchronously and return its stdout lines (EMPTY on failure — a non-zero exit / raised error
+--- yields `{}`, never the error text, so callers get a clean "no output" contract).
 ---@param argv string[]
 ---@return string[]
 function M.run_lines(argv)
     local ok, res = pcall(vim.fn.systemlist, argv)
     if not ok or vim.v.shell_error ~= 0 then
-        return type(res) == "table" and res or {}
+        return {}
     end
     return res or {}
 end
@@ -495,20 +515,12 @@ end
 --- Spawn `argv` and stream its stdout LINES asynchronously — `on_lines(lines)` is called (on the main loop)
 --- for each batch of complete lines as they arrive, `on_done()` once at exit. NEVER blocks the editor (unlike
 --- `run_lines`), so a huge tree (e.g. `~/`) lists incrementally instead of a multi-second freeze. Returns a
---- cancel function that kills the producer. Falls back to a one-shot sync read when `vim.system` is missing.
+--- cancel function that kills the producer.
 ---@param argv string[]
 ---@param on_lines fun(lines: string[])
 ---@param on_done fun()
 ---@return fun() cancel
 function M.spawn_stream(argv, on_lines, on_done)
-    if type(vim.system) ~= "function" then
-        local lines = M.run_lines(argv)
-        vim.schedule(function()
-            on_lines(lines)
-            on_done()
-        end)
-        return function() end
-    end
     local rest = "" -- partial trailing line carried between chunks
     local function emit(data, final)
         rest = rest .. data
@@ -554,5 +566,21 @@ function M.spawn_stream(argv, on_lines, on_done)
         end)
     end
 end
+
+-- Devicon colours are baked (once) into ANSI escapes — the shell-pipe map file (`icon_state`) and the
+-- Lua-list cache (`lua_icon_cache`) — so a colourscheme change would otherwise leave every ft icon at its
+-- OLD colour. Drop both caches (and remove the stale on-disk map file) on `ColorScheme`; they rebuild lazily
+-- with the live palette on the next listing. (`rg_color_flags` already reads the palette live, so grep colours
+-- track the theme on their own — nothing to invalidate there.)
+vim.api.nvim_create_autocmd("ColorScheme", {
+    group = vim.api.nvim_create_augroup("LvimPickerSourceIcons", { clear = true }),
+    callback = function()
+        if type(icon_state) == "table" and icon_state.map then
+            os.remove(icon_state.map)
+        end
+        icon_state = nil
+        lua_icon_cache = {}
+    end,
+})
 
 return M
