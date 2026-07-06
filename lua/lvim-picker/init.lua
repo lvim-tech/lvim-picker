@@ -1583,12 +1583,15 @@ end
 ---@param opts? table
 function M.grep_word(opts)
     opts = opts or {}
-    vim.ui.input({ prompt = "Grep: " }, function(q)
-        if q and q ~= "" then
-            opts.query, opts.title = q, "Grep: " .. q
-            M.grep(opts)
-        end
-    end)
+    require("lvim-ui").input({
+        prompt = "Grep",
+        callback = function(confirmed, q)
+            if confirmed == true and q and q ~= "" then
+                opts.query, opts.title = q, "Grep: " .. q
+                M.grep(opts)
+            end
+        end,
+    })
 end
 
 --- Live-grep the CURRENT file only.

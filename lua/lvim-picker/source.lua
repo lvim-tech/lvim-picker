@@ -248,7 +248,7 @@ function M.with_dir_icon(argv)
     if (config or {}).show_icons == false then
         return argv
     end
-    local glyph = (config.dashboard.icons or {}).directory or ""
+    local glyph = (config.icons or {}).directory or ""
     if glyph == "" then
         return argv
     end

@@ -13,6 +13,7 @@
 ---@field grep_multiline  integer|boolean The fzf grep result layout: 1 = 2-row, 2 = 2-row + gap, false/0 = 1-row
 ---@field statusline      boolean  Publish the finder title + counter + query to the bottom statusline
 ---@field source          table    files/directories listing engine + what it ignores (engine / exclude / hidden / …)
+---@field icons           table    Shared glyphs used by source helpers
 ---@field prompt          table    The prompt badge before the query (icon / label / spacing pads)
 ---@field caret           table    The input caret (hl group + guicursor shape)
 ---@field hl              table    Highlight groups for every finder element (all overridable)
@@ -69,6 +70,9 @@ return {
     -- The MARK indicator drawn in the one blank column in front of a marked row (multi-select), in red — both
     -- backends. The canonical pointer glyph `➤` (U+27A4) reads cleanly in that single space.
     marker = "➤",
+    icons = {
+        directory = "󰉋",
+    },
 
     -- The glyph that DIVIDES footer button GROUPS (open-methods · list-actions · frame-nav). Its colour is the
     -- `LvimUiFooterSep` highlight; the glyph itself is configurable here (a footer DIVIDER dot — distinct from
