@@ -14,6 +14,7 @@
 ---@field statusline      boolean  Publish the finder title + counter + query to the bottom statusline
 ---@field source          table    files/directories listing engine + what it ignores (engine / exclude / hidden / …)
 ---@field icons           table    Shared glyphs used by source helpers
+---@field icon_provider    "auto"|"lvim"|"devicons"|"mini"  Which plugin supplies file icons (via lvim-utils.icons)
 ---@field prompt          table    The prompt badge before the query (icon / label / spacing pads)
 ---@field caret           table    The input caret (hl group + guicursor shape)
 ---@field hl              table    Highlight groups for every finder element (all overridable)
@@ -70,6 +71,9 @@ return {
     -- The MARK indicator drawn in the one blank column in front of a marked row (multi-select), in red — both
     -- backends. The canonical pointer glyph `➤` (U+27A4) reads cleanly in that single space.
     marker = "➤",
+    -- Which icon plugin supplies file glyphs (both backends), resolved through lvim-utils.icons:
+    -- "auto" prefers lvim-icons, then nvim-web-devicons, then mini.icons, else no icons.
+    icon_provider = "auto",
     icons = {
         directory = "󰉋",
     },

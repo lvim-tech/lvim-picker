@@ -9,6 +9,7 @@
 ---@module "lvim-picker.source"
 
 local config = require("lvim-picker.config")
+local iconlib = require("lvim-utils.icons")
 
 local M = {}
 
@@ -188,17 +189,13 @@ local GREP_ICON_AWK_ML_BODY = [=['BEGIN{FS="\t";while((getline l<MAP)>0){split(l
 local GREP_AWK_ML = [=[awk '{if(match($0,/^[^:]*:[^:]*:[^:]*:/)){h=substr($0,1,RLENGTH-1);t=substr($0,RLENGTH+1);]=]
     .. [=[printf "%s\n    %s%c",h,t,0}else{printf "%s%c",$0,0}}']=]
 
---- Build (once) the icon lookup, or false when nvim-web-devicons is absent.
+--- Build (once) the icon lookup, or false when the active provider offers no icon table.
 ---@return { map: string, default: string }|false
 local function icons()
     if icon_state ~= nil then
         return icon_state
     end
-    local ok, dev = pcall(require, "nvim-web-devicons")
-    if not ok then
-        icon_state = false
-        return icon_state
-    end
+    local provider = config.icon_provider
     local function ansi(glyph, color)
         local r, g, b = (color or ""):match("^#(%x%x)(%x%x)(%x%x)$")
         if not r then
@@ -207,16 +204,20 @@ local function icons()
         return ("\27[38;2;%d;%d;%dm%s\27[0m"):format(tonumber(r, 16), tonumber(g, 16), tonumber(b, 16), glyph)
     end
     local lines = {}
-    for key, def in pairs(dev.get_icons() or {}) do
+    for key, def in pairs(iconlib.get_icons({ provider = provider })) do
         if def.icon then
             lines[#lines + 1] = key .. "\t" .. ansi(def.icon, def.color)
         end
     end
-    local dglyph, dhl = dev.get_icon("", "", { default = true })
-    local dfg = dhl and (vim.api.nvim_get_hl(0, { name = dhl, link = false }) or {}).fg
+    if #lines == 0 then
+        -- No provider installed / no enumerable icon table → stream paths without icons.
+        icon_state = false
+        return icon_state
+    end
+    local dr = iconlib.get("", { provider = provider })
     local f = vim.fn.tempname()
     pcall(vim.fn.writefile, lines, f)
-    icon_state = { map = f, default = ansi(dglyph or "", dfg and ("#%06x"):format(dfg) or nil) }
+    icon_state = { map = f, default = ansi(dr.glyph or "", dr.color) }
     return icon_state
 end
 
@@ -291,42 +292,34 @@ function M.file_icon(name)
     if (config or {}).show_icons == false then
         return ""
     end
-    local ok, dev = pcall(require, "nvim-web-devicons")
-    if not ok then
-        return ""
-    end
     local base = name:match("[^/]+$") or name
     local ext = base:match("%.([^.]+)$") or ""
     local key = ext ~= "" and ext or base
     if lua_icon_cache[key] ~= nil then
         return lua_icon_cache[key]
     end
-    local glyph, hl = dev.get_icon(base, ext, { default = true })
-    local fg = hl and (vim.api.nvim_get_hl(0, { name = hl, link = false }) or {}).fg
-    local s = glyph or ""
-    if fg and s ~= "" then
-        s = ("\27[38;2;%d;%d;%dm%s\27[0m"):format(math.floor(fg / 65536) % 256, math.floor(fg / 256) % 256, fg % 256, s)
+    local r = iconlib.get(name, { provider = config.icon_provider })
+    local s = r.glyph or ""
+    local rr, gg, bb = (r.color or ""):match("^#(%x%x)(%x%x)(%x%x)$")
+    if rr and s ~= "" then
+        s = ("\27[38;2;%d;%d;%dm%s\27[0m"):format(tonumber(rr, 16), tonumber(gg, 16), tonumber(bb, 16), s)
     end
     s = s ~= "" and (s .. " ") or ""
     lua_icon_cache[key] = s
     return s
 end
 
---- The ft devicon glyph + its highlight-group NAME for `name` (e.g. `"", "DevIconLua"`), or nil when icons
---- are off / unavailable. For the TINT (lua-list) backend, which draws the glyph via an extmark coloured by the
---- (nvim-web-devicons-defined) DevIcon* group — no ANSI.
+--- The ft icon glyph + its highlight-group NAME for `name` (e.g. `"", "LvimIconBlue"`), or nil when icons
+--- are off. For the TINT (lua-list) backend, which draws the glyph via an extmark coloured by the provider's
+--- highlight group. The provider is the configured `icon_provider` (resolved via lvim-utils.icons).
 ---@param name string
 ---@return string? glyph, string? hl
 function M.devicon(name)
     if (config or {}).show_icons == false then
         return nil
     end
-    local ok, dev = pcall(require, "nvim-web-devicons")
-    if not ok then
-        return nil
-    end
-    local base = name:match("[^/]+$") or name
-    return dev.get_icon(base, base:match("%.([^.]+)$") or "", { default = true })
+    local r = iconlib.get(name, { provider = config.icon_provider })
+    return r.glyph, r.hl
 end
 
 --- Build the ripgrep argv for a LIVE content search of `query`, sharing the file-source config so CONTENT

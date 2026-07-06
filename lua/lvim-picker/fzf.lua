@@ -24,6 +24,7 @@ local ui_config = require("lvim-ui.config")
 local colors = require("lvim-utils.colors")
 local highlight = require("lvim-utils.highlight")
 local cursor = require("lvim-utils.cursor")
+local iconlib = require("lvim-utils.icons")
 local surface = require("lvim-ui.surface")
 local source = require("lvim-picker.source")
 local preview = require("lvim-ui.preview")
@@ -226,12 +227,8 @@ local function set_preview_winbar(pan, item)
         local tail = vim.fn.fnamemodify(rel, ":t")
         local dir = vim.fn.fnamemodify(rel, ":h")
         dir = (dir == "." or dir == "") and "" or (dir .. "/")
-        local icon = ""
-        local ok_dev, dev = pcall(require, "nvim-web-devicons")
-        if ok_dev then
-            local gl = dev.get_icon(tail, vim.fn.fnamemodify(tail, ":e"), { default = true })
-            icon = gl and (gl .. " ") or ""
-        end
+        local gl = iconlib.get(tail, { provider = config.icon_provider }).glyph
+        local icon = (gl and gl ~= "") and (gl .. " ") or ""
         vim.wo[pan.win].winbar = ("%%#%s# %s%s %%#%s# %s %%#%s#%%="):format(
             FILE,
             esc(icon),

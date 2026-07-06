@@ -15,6 +15,7 @@ local config = require("lvim-picker.config")
 local ui_config = require("lvim-ui.config")
 local fuzzy = require("lvim-picker.fuzzy")
 local utils = require("lvim-utils.utils")
+local iconlib = require("lvim-utils.icons")
 local ui_filters = require("lvim-ui.filters")
 local preview = require("lvim-ui.preview")
 -- The listing commands / preview reader / async streamer live in picker.source so BOTH backends (this tint
@@ -521,14 +522,11 @@ function M.open(opts)
             local tail = vim.fn.fnamemodify(rel, ":t")
             local dir = vim.fn.fnamemodify(rel, ":h")
             dir = (dir == "." or dir == "") and "" or (dir .. "/")
-            -- the file's devicon (when nvim-web-devicons is present and `preview.show_icon`)
+            -- the file's icon (from the configured icon_provider, when `preview.show_icon`)
             local icon = ""
             if prevcfg.show_icon ~= false then
-                local ok_dev, dev = pcall(require, "nvim-web-devicons")
-                if ok_dev then
-                    local gl = dev.get_icon(tail, vim.fn.fnamemodify(tail, ":e"), { default = true })
-                    icon = gl and (gl .. " ") or ""
-                end
+                local gl = iconlib.get(tail, { provider = config.icon_provider }).glyph
+                icon = (gl and gl ~= "") and (gl .. " ") or ""
             end
             -- name = icon + file (bright); dir = padded path on the winbar bg (so it blends into the bar)
             local dpl, dpr = prevcfg.dir_pad_left or 1, prevcfg.dir_pad_right or 1
