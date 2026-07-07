@@ -16,6 +16,7 @@
 ---@field keys            table    All finder keys (accept / mark / quickfix / preview scroll / park / abort / nav)
 ---@field marker          string   The mark indicator glyph drawn before a marked row (multi-select)
 ---@field grep_multiline  integer|boolean The fzf grep result layout: 1 = 2-row, 2 = 2-row + gap, false/0 = 1-row
+---@field title_pos       "left"|"center"|"right"  Finder-title alignment — every layout the same (default "center")
 ---@field statusline      boolean  Publish the finder title + counter + query to the bottom statusline
 ---@field source          table    files/directories listing engine + what it ignores (engine / exclude / hidden / …)
 ---@field icons           table    Shared glyphs used by source helpers
@@ -132,6 +133,11 @@ return {
     -- Needs fzf >= 0.53 (uses `--read0` / `--print0` / `--gap`); silently falls back to the 1-row layout on
     -- older fzf. Only the fzf-TUI grep backend honours this; the tint/Lua grep list is always single-row.
     grep_multiline = 1,
+
+    -- The finder TITLE's alignment ("left" | "center" | "right") — layout-independent (float / area / bottom
+    -- all the same), applied to the title row band and the native border-title alike. The title TEXT itself
+    -- stays dynamic per finder (Files / Grep / …). A per-call `opts.title_pos` overrides this global.
+    title_pos = "center",
 
     -- Publish the finder's title + match counter + query to the bottom statusline (lvim-hud.overlay) for
     -- EVERY docked finder (area/bottom) — diagnostics, buffers, any plugin's picker. false = each finder draws

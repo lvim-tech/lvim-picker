@@ -171,6 +171,9 @@ require("lvim-picker").setup({
     },
     -- fzf grep result layout: 1 = 2-row, 2 = 2-row + gap, false/0 = single-row path:lnum:col:text.
     grep_multiline = 1,
+    -- Finder-title alignment: "left" | "center" | "right" — the same in every layout (float/area/bottom).
+    -- The title text itself stays dynamic per finder; a per-call `opts.title_pos` overrides this.
+    title_pos = "center",
     -- Publish the finder title + counter + query to the statusline (via lvim-hud) for docked finders.
     statusline = true,
     -- How `files` / `directories` list entries + what they ignore.

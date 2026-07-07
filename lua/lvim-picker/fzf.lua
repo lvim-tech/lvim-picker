@@ -248,6 +248,7 @@ end
 ---@field title? string  the finder title — the chassis native centered border-title
 ---@field icon? string  an optional leading glyph fronting the title
 ---@field title_line? string  title placement: "row" (a top content row, default) | "statusline" (the centralized chrome overlay) | "border" (opt-in native border-title)
+---@field title_pos? "left"|"center"|"right"  title alignment override for THIS open (default: `config.title_pos`, layout-independent)
 ---@field counter? string  match-count placement: "footer" (default — the bottom-right border) | "title" (folded into the border-title)
 ---@field preview_side? string  where the preview panel sits: "right" (default) | "left" | "above" | "below"
 ---@field cmd? string[]  the producer argv (FZF_DEFAULT_COMMAND): fzf runs + streams it (files / dirs / git)
@@ -1367,6 +1368,7 @@ function M.open(opts)
         header_air = false,
         title = title_box, -- the chassis native centered border-title
         title_line = opts.title_line, -- title placement: "row" (default) | "statusline" (chassis overlay) | "border" (opt-in)
+        title_pos = opts.title_pos or config.title_pos, -- alignment — ONE config value for every layout
         count = count_fn, -- the live fzf match / total count → the chassis border counter (default footer)
         counter = opts.counter, -- count placement: "footer" (default) | "title"
         -- The container border is CONFIG-DRIVEN on EVERY layout (float + docked) — `surface.FRAME_BORDER`

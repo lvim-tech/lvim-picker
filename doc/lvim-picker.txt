@@ -123,7 +123,9 @@ Merges {opts} into the live config in place (a nested `fuzzy` subtable merges
 into `lvim-picker.fuzzy.config`) and registers `:LvimPicker`. Optional. See the
 README for the FULL default config; the option set is documented as
 `LvimPickerConfig` in `lua/lvim-picker/config.lua` (layout, dock = { dock_stack,
-force }, fzf_tui, keys, marker, footer, source, prompt, caret, hl, preview, …).
+force }, fzf_tui, keys, marker, footer, title_pos, source, prompt, caret, hl,
+preview, …). `title_pos` ("center" default) aligns the finder title the same
+way in every layout; the title text stays dynamic per finder.
 See
 |lvim-picker-dock_stack| for docking and |lvim-picker-per-call| for the
 per-call `opts.dock_stack` / `opts.force` passthrough.
