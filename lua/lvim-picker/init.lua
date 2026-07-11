@@ -1,12 +1,12 @@
 -- lvim-picker: the native fuzzy-finder — the tint-striped Lua list backend plus the ready-made finders.
 -- A native fuzzy finder built on the lvim-ui.surface chassis: a centred float with a typed query
 -- INPUT band on top (a surface header input), a results LIST panel on the left and a scrollable PREVIEW
--- panel on the right — the diagnostics-peek layout, but fuzzy. The MATCHING ENGINE is the native `fzf`
--- binary in --filter mode (no TUI): candidates go in on stdin, fzf returns them matched + ranked by score,
--- and the surface renders the result. So ranking is fzf's exactly while WE own the view (engine vs view,
--- like the blink integration). Without fzf it falls back to a Lua subsequence matcher
--- (lvim-utils.utils.match_indices). Highlight positions are always computed locally (fzf's --filter does
--- not emit them), so the matched characters light up in the list.
+-- panel on the right — the diagnostics-peek layout, but fuzzy. The MATCHING ENGINE is lvim-fuzzy — the
+-- shared native matcher of the lvim-tech set (in-process FFI; its own pure-Lua fallback when the .so is
+-- absent): the candidate set is prepared once per pool, each keystroke is one match call, and the surface
+-- renders the result. So ranking is lvim-fuzzy's exactly while WE own the view (engine vs view, like the
+-- blink integration). Highlight positions are computed locally (lvim-utils.utils.match_indices — the engine
+-- emits indices+scores only), so the matched characters light up in the list.
 --
 ---@module "lvim-picker"
 
@@ -1487,7 +1487,7 @@ build = function(opts, kind)
                 pcall(state.stream_cancel)
                 state.stream_cancel = nil
             end
-            _texts_cache = nil -- drop the cached candidate texts (and let fuzzy drop its temp file) for this run
+            _texts_cache = nil -- drop the cached candidate texts (and the fuzzy prepared context) for this run
             fuzzy.release()
             if state.input_buf then -- drop the custom blue caret registration (cursor module restores normal)
                 pcall(require("lvim-utils.cursor").mark_cursor_buffer, state.input_buf, nil)

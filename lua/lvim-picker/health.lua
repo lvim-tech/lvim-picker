@@ -1,6 +1,7 @@
 -- lvim-picker.health: `:checkhealth lvim-picker` — reports that the finders are loadable, their required
--- deps (lvim-ui toolkit, lvim-utils base, the fzf binary for the TUI backend) are present, and which optional
--- integrations exist (lvim-hud for the statusline title overlay, lvim-msgarea for the area dock).
+-- deps (lvim-ui toolkit, lvim-utils base, the lvim-fuzzy matching engine, the fzf binary for the TUI
+-- backend) are present, and which optional integrations exist (lvim-hud for the statusline title overlay,
+-- lvim-msgarea for the area dock).
 --
 ---@module "lvim-picker.health"
 
@@ -38,6 +39,13 @@ function M.check()
         ok("lvim-ui toolkit is available")
     else
         err("lvim-ui not found — lvim-picker builds its finders on it")
+    end
+
+    -- The matching engine of the tint (Lua-list) backend: prepared-context ranking through lvim-fuzzy.
+    if has("lvim-fuzzy") then
+        ok(("lvim-fuzzy engine is available (backend: %s)"):format(require("lvim-fuzzy").backend()))
+    else
+        err("lvim-fuzzy not found — lvim-picker ranks every finder through it (install lvim-tech/lvim-fuzzy)")
     end
 
     if has("lvim-picker") and has("lvim-picker.fuzzy") then

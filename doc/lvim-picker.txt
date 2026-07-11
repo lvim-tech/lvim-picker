@@ -23,7 +23,9 @@ keys, and docks as a centred float, a bottom dock, or the message-zone area.
 2. REQUIREMENTS                                        *lvim-picker-requirements*
 
 - Neovim >= 0.12.x
-- lvim-utils and lvim-ui
+- lvim-utils, lvim-ui and lvim-fuzzy (the shared matching engine — every finder
+  ranks through it; it degrades to its own pure-Lua matcher when its native
+  library is not built)
 - the `fzf` binary (+ `mkfifo`) for the fzf-TUI backend (falls back to the Lua
   tint list without it)
 - optional: lvim-hud (statusline overlay), lvim-msgarea (the `area` dock)
@@ -38,6 +40,7 @@ Native (vim.pack): >lua
     vim.pack.add({
         { src = "https://github.com/lvim-tech/lvim-utils" },
         { src = "https://github.com/lvim-tech/lvim-ui" },
+        { src = "https://github.com/lvim-tech/lvim-fuzzy" },
         { src = "https://github.com/lvim-tech/lvim-picker" },
     })
     require("lvim-picker").setup({})

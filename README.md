@@ -7,8 +7,10 @@ look and one set of keys, and docks as a centred float, a bottom dock, or the me
 
 ## Requirements
 
-Requires **Neovim >= 0.12.x**, [lvim-utils](https://github.com/lvim-tech/lvim-utils) and
-[lvim-ui](https://github.com/lvim-tech/lvim-ui). The fzf-TUI backend needs the `fzf` binary (and `mkfifo`);
+Requires **Neovim >= 0.12.x**, [lvim-utils](https://github.com/lvim-tech/lvim-utils),
+[lvim-ui](https://github.com/lvim-tech/lvim-ui) and [lvim-fuzzy](https://github.com/lvim-tech/lvim-fuzzy)
+(the shared matching engine — its optional native library makes ranking fastest, and it degrades to its own
+pure-Lua matcher on its own). The fzf-TUI backend needs the `fzf` binary (and `mkfifo`);
 without it the finders fall back to the Lua tint list. Optional:
 [lvim-hud](https://github.com/lvim-tech/lvim-hud) (statusline title overlay) and
 [lvim-msgarea](https://github.com/lvim-tech/lvim-msgarea) (the `area` dock in the message zone).
@@ -27,6 +29,7 @@ without it the finders fall back to the Lua tint list. Optional:
 vim.pack.add({
     { src = "https://github.com/lvim-tech/lvim-utils" },
     { src = "https://github.com/lvim-tech/lvim-ui" },
+    { src = "https://github.com/lvim-tech/lvim-fuzzy" },
     { src = "https://github.com/lvim-tech/lvim-picker" },
 })
 require("lvim-picker").setup({})
@@ -223,10 +226,10 @@ require("lvim-picker").setup({
     -- Soft-wrap the list rows instead of truncating long matches.
     list_wrap = false,
 
-    -- The fuzzy matching engine (merged into lvim-picker.fuzzy.config).
+    -- Result ordering + cap around the shared lvim-fuzzy engine (merged into lvim-picker.fuzzy.config).
     fuzzy = {
         sort = "score", -- ordering: "score" | a list of sort keys | a function
-        max_results = 1000, -- cap on ranked results
+        max_results = 1000, -- cap on ranked results (lvim-fuzzy's own max_results also applies)
     },
 })
 ```
