@@ -512,7 +512,7 @@ build = function(opts, kind)
     end
     local surface = require("lvim-ui.surface")
     local items = normalize(opts.items, opts.format)
-    local maxr = opts.max_rows or 15
+    local maxr = opts.max_rows or config.max_rows
     local state = {
         filtered = items,
         sel = 1,

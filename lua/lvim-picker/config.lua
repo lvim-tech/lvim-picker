@@ -37,6 +37,10 @@ return {
     -- bottom dock). A per-call `opts.layout` (or a `:LvimPicker <finder> <layout>` arg) overrides it.
     layout = "area",
 
+    -- The tint-list finder's max visible rows (a secondary cap under the dock geometry height). A per-call
+    -- `opts.max_rows` overrides it.
+    max_rows = 15,
+
     -- This plugin's OWN docking defaults, NAMESPACED under `dock` (matching lvim-dependencies'
     -- `config.dock.dock_stack` / `config.dock.force`). Per-call `opts.dock_stack` / `opts.force`
     -- still override these for a single open.
