@@ -1,9 +1,10 @@
 -- lvim-picker.fuzzy: shared fuzzy MATCHING engine: rank a list of strings against a query. The engine is
 -- lvim-fuzzy — the shared native matcher of the lvim-tech set (in-process Rust FFI, with its own
 -- byte-identical pure-Lua fallback when the .so is absent, so this module never branches on availability).
--- The candidate set is PREPARED once per pool (one packed upload, cached by array reference + length);
--- every keystroke is then a single match call that is O(matched), not O(candidates) — this replaced the
--- per-keystroke `fzf --filter` subprocess that re-scanned the whole set (76–790 ms at 200k–1.5M).
+-- The candidate set is PREPARED once per pool (one packed upload, cached by array reference + length) and
+-- a stream-grown pool APPENDS only its new tail into the live context (incremental, O(new) — never a whole
+-- re-prepare); every keystroke is then a single match call that is O(matched), not O(candidates) — this
+-- replaced the per-keystroke `fzf --filter` subprocess that re-scanned the whole set (76–790 ms at 200k–1.5M).
 -- lvim-fuzzy returns indices + scores only, so match POSITIONS for highlighting are computed locally
 -- (utils.match_indices) — but only for the top `max_results` rows actually returned, never the whole set.
 -- Used by the picker and by the native cmdline-completion integration (lvim-msgarea), so both share one
@@ -70,27 +71,27 @@ local function comparator(spec)
     end
 end
 
---- Reorder `ranked` (`{ idx, match? }`, in fuzzy order) per `config.sort`. Decorates each entry with
---- `text`/`is_dir`/`ext`/`rank` for the criteria, sorts, and returns the reordered list (idx/match kept).
----@param ranked { idx: integer, match?: integer[] }[]
----@param texts string[]
----@return { idx: integer, match?: integer[] }[]
-local function apply_sort(ranked, texts)
+--- Reorder `ranked` (in fuzzy order) per `config.sort`. Decorates each entry with `text`/`is_dir`/`ext`/`rank`
+--- for the criteria, sorts, and returns the reordered list (the original fields are carried through). `text_of`
+--- yields each entry's candidate text — from a shared `texts[r.idx]` array (the static path) or an inline
+--- `r.text` (the blob path).
+---@generic T : { idx: integer }
+---@param ranked T[]
+---@param text_of fun(r: T): string
+---@return T[]
+local function apply_sort(ranked, text_of)
     local spec = (config or {}).sort or "score"
     if spec == "score" then
         return ranked -- already in best-match order
     end
     local decorated = {}
     for rank, r in ipairs(ranked) do
-        local t = texts[r.idx]
-        decorated[rank] = {
-            idx = r.idx,
-            match = r.match,
-            text = t,
-            rank = rank,
-            is_dir = t:sub(-1) == "/",
-            ext = t:match("%.([%w_%-]+)/?$") or "",
-        }
+        local t = text_of(r)
+        r.text = t
+        r.rank = rank
+        r.is_dir = t:sub(-1) == "/"
+        r.ext = t:match("%.([%w_%-]+)/?$") or ""
+        decorated[rank] = r
     end
     table.sort(decorated, comparator(spec))
     return decorated
@@ -100,22 +101,148 @@ end
 -- (the exact contract of the picker's `_texts_cache`: the query changes on every keystroke but the candidate
 -- set does NOT, so the context is rebuilt only when the pool actually changes — appended by a stream feed
 -- (same reference, grown length), replaced by a refresh, or narrowed by a filter (new reference)). Over a
--- stable pool a keystroke is therefore ONE match call against the ready context, never a re-upload.
--- NOTE: lvim-fuzzy has no incremental append yet, so a pool that GREW re-prepares over the whole array (one
--- packed upload — tens of ms at 1.5M) rather than feeding just the tail; the context is built lazily on the
--- first real query, so a stream that finishes before typing pays it exactly once.
+-- stable pool a keystroke is therefore ONE match call against the ready context, never a re-upload. A pool
+-- that GREW in place feeds ONLY the new tail into the live context (`engine.append`, ABI 2 — O(new), sub-ms
+-- even at 1.5M) instead of re-preparing the whole set (~130–200 ms per growth there); the context is still
+-- built lazily on the first real query, so a stream that finishes before typing pays one prepare, and typing
+-- WHILE it feeds pays only appends. Append is byte-identical to a whole prepare (lvim-fuzzy guarantee).
 ---@type { texts: string[], len: integer, ctx: LvimFuzzyContext }?
 local _ctx_cache
 
---- The prepared lvim-fuzzy context for `texts`, building (and caching) it when the pool is new or changed.
+local uv = vim.uv or vim.loop
+
+-- BOUNDED MARSHALING. Feeding a streamed pool (up to ~2M paths) into the native matcher is O(pool) Lua↔C
+-- string work — a single whole prepare / large append blocks the UI for 50–80 ms at scale (measured). So we
+-- never marshal the whole outstanding tail in one call: `ensure_ctx` moves at most `marshal_cap` candidates
+-- per call (a ≈5–8 ms slice) and a background timer keeps feeding the rest in equal slices across event-loop
+-- ticks until the native context catches up to the pool, then runs ONE final match of the last query so the
+-- results reflect the full set. The match always runs against whatever is marshaled so far (which grows), so
+-- results appear and refine progressively during the stream instead of the UI freezing.
+---@type uv.uv_timer_t?
+local _marshal_timer
+---@type string?
+local _last_query -- last non-empty query + its callback, replayed once when the background marshal catches up
+---@type fun(ranked: { idx: integer, match?: integer[] }[])?
+local _last_cb
+
+--- Stop and release the background catch-up timer (if running).
+local function stop_marshal()
+    if _marshal_timer then
+        _marshal_timer:stop()
+        if not _marshal_timer:is_closing() then
+            _marshal_timer:close()
+        end
+        _marshal_timer = nil
+    end
+end
+
+--- Marshal ONE bounded slice of the outstanding tail (`c.len+1 .. min(pool, c.len+cap)`) into the live native
+--- context via `engine.append`, advancing `c.len`. Returns true once the context has caught up to the pool.
+---@param c { texts: string[], len: integer, ctx: LvimFuzzyContext }
+---@return boolean caught_up
+local function marshal_slice(c)
+    local n = #c.texts
+    local cap = (config or {}).marshal_cap or 32768
+    local upto = math.min(n, c.len + cap)
+    local tail = {}
+    for i = c.len + 1, upto do
+        tail[i - c.len] = c.texts[i]
+    end
+    engine.append(c.ctx, tail)
+    c.len = upto
+    return c.len >= n
+end
+
+--- Arm the background catch-up: keep marshaling bounded slices into the native context, across event-loop
+--- ticks (so it never blocks), until it reaches the pool. While the pool is still GROWING it only APPENDS —
+--- it never re-runs the query (matching during the stream is driven by the 500 ms stream-refresh, which lets
+--- each match complete; a match kicked off on every momentary catch-up would supersede the in-flight one
+--- forever, so nothing would ever settle). Only once the pool holds STEADY for a couple of ticks — i.e. the
+--- stream has finished — does it replay the last query ONCE, over the now-complete context, for full-set
+--- results. Idempotent: a marshal already in flight keeps running against the (still growing) pool.
+---@param texts string[]
+local function arm_marshal(texts)
+    if _marshal_timer then
+        return
+    end
+    local settled = 0 -- consecutive ticks the context has fully covered a pool that stopped growing
+    local timer = uv.new_timer()
+    _marshal_timer = timer
+    timer:start(
+        40,
+        40,
+        vim.schedule_wrap(function()
+            -- A blocked main thread can queue several ticks of this timer that then drain together; once the
+            -- timer has been stopped (or replaced by a fresh arm), ignore those stale queued callbacks so they
+            -- do not each kick off a match.
+            if _marshal_timer ~= timer then
+                return
+            end
+            local c = _ctx_cache
+            if not (c and c.texts == texts) then -- pool replaced / released → abandon this catch-up
+                stop_marshal()
+                return
+            end
+            if c.len < #texts then
+                marshal_slice(c) -- still behind the stream → feed one bounded slice, do NOT match
+                settled = 0
+                return
+            end
+            settled = settled + 1
+            if settled >= 2 then -- pool has held steady ⇒ stream finished → one final full-context match
+                stop_marshal()
+                if _last_query and _last_query ~= "" and _last_cb then
+                    M.filter(texts, _last_query, _last_cb)
+                end
+            end
+        end)
+    )
+end
+
+--- The prepared lvim-fuzzy context for `texts`, building (and caching) it when the pool is new or changed,
+--- and APPENDING only the new tail when the same pool grew in place (the stream-feed contract). Marshaling is
+--- BOUNDED (see above): a huge pool is prepared/appended a slice at a time, the background timer feeding the
+--- rest, so this never blocks — the returned context may cover only the pool's head until the marshal catches
+--- up (a growing prefix, which is exactly what a live-streaming finder should search).
 ---@param texts string[]
 ---@return LvimFuzzyContext
 local function ensure_ctx(texts)
-    if _ctx_cache and _ctx_cache.texts == texts and _ctx_cache.len == #texts then
-        return _ctx_cache.ctx
+    local n = #texts
+    local c = _ctx_cache
+    if c and c.texts == texts then
+        if c.len >= n then
+            return c.ctx
+        end
+        -- The pool GREW in place (stream feed — same array ref, larger length): extend the live context with
+        -- a bounded slice of the new tail now, and let the background timer feed the rest. Gated on real
+        -- incrementality: the native ABI-2 append, or the pure-Lua backend (which keeps no per-candidate
+        -- state, so growing the list IS the append). An ABI-1 .so would only defer a whole re-upload into the
+        -- next match call, so it re-prepares below instead.
+        if engine.has_append() or not engine.native_loaded() then
+            if not marshal_slice(c) then
+                arm_marshal(texts) -- tail remains → catch up in the background
+            end
+            return c.ctx
+        end
+        -- shrank (a new pool reused the array — not the stream contract) or no incremental append → rebuild
     end
-    local ctx = engine.prepare(texts)
-    _ctx_cache = { texts = texts, len = #texts, ctx = ctx }
+    -- New / replaced pool: prepare only the first `marshal_cap` now (bounded — a whole prepare over millions
+    -- would block); the background timer appends the rest. The context OWNS its candidate list (`engine.append`
+    -- grows it in place), while `texts` is the picker's pool cache that ALSO grows in place — hand the engine
+    -- its own shallow copy, never the shared array (sharing it would make the engine-side append double-write
+    -- the tail into the picker's pool).
+    stop_marshal()
+    local cap = (config or {}).marshal_cap or 32768
+    local upto = math.min(n, cap)
+    local owned = {}
+    for i = 1, upto do
+        owned[i] = texts[i]
+    end
+    local ctx = engine.prepare(owned)
+    _ctx_cache = { texts = texts, len = upto, ctx = ctx }
+    if upto < n then
+        arm_marshal(texts)
+    end
     return ctx
 end
 
@@ -135,9 +262,12 @@ function M.filter(texts, query, cb)
     local max = (config or {}).max_results or 1000
     -- every path delivers through here so the config sort (dirs_first / ext / …) is applied uniformly
     local function deliver(ranked)
-        cb(apply_sort(ranked, texts))
+        cb(apply_sort(ranked, function(r)
+            return texts[r.idx]
+        end))
     end
     if query == "" then
+        _last_query, _last_cb = nil, nil -- an empty query needs no full-pool replay when the marshal catches up
         local out = {}
         for i = 1, math.min(#texts, max) do -- first `max` in source order (no matching on an empty query)
             out[i] = { idx = i }
@@ -145,21 +275,114 @@ function M.filter(texts, query, cb)
         deliver(out)
         return
     end
-    local results = engine.match(query, ensure_ctx(texts))
-    local out = {}
-    for k = 1, math.min(#results, max) do
-        local idx = results[k].index
-        -- lvim-fuzzy emits index+score only; compute the highlight positions locally, for the returned
-        -- top rows ONLY (~max_results — cheap), never over the whole candidate set.
-        out[k] = { idx = idx, match = utils.match_indices(query, texts[idx]) }
-    end
-    deliver(out)
+    -- Remember this query so the background marshal can replay it once the native context reaches the full pool
+    -- (see arm_marshal) — otherwise a query typed mid-stream would keep showing head-only results until the
+    -- next keystroke. `cb` is the finder's gen-guarded refilter callback, so a stale replay is dropped safely.
+    _last_query, _last_cb = query, cb
+    -- ASYNC: the match is driven in slices across event-loop ticks (lvim-fuzzy's chunked ABI-3 path), so a
+    -- match over a HUGE pool never blocks typing — the editor redraws and handles input between slices, and a
+    -- newer query SUPERSEDES an in-flight one engine-side. `cb` fires on a later tick (the finder's `refilter`
+    -- is already gen-guarded, and the callers were wired for the original async engine). On an ABI < 3 / Lua
+    -- backend it degrades to a scheduled synchronous match. Positions are computed for the returned top rows
+    -- only (~max_results — cheap), never over the whole candidate set.
+    engine.match_async(query, ensure_ctx(texts), function(results, cnt)
+        local out = {}
+        for k = 1, math.min(cnt, max) do
+            local idx = results[k].index
+            out[k] = { idx = idx, match = utils.match_indices(query, texts[idx]) }
+        end
+        deliver(out)
+    end)
 end
 
 --- Drop the cached prepared context. A finder calls this on close so the packed candidate blob (large at
---- huge-tree scale) does not linger in this module until the next search replaces it.
+--- huge-tree scale) does not linger in this module until the next search replaces it — `engine.free` also
+--- releases the NATIVE side eagerly (ABI 2), so ~60–100 MB of prepared context is reclaimed on close instead
+--- of lingering until another search re-prepares.
 function M.release()
-    _ctx_cache = nil
+    stop_marshal() -- cancel any background catch-up before the context it feeds is freed
+    _last_query, _last_cb = nil, nil
+    if _ctx_cache then
+        engine.free(_ctx_cache.ctx)
+        _ctx_cache = nil
+    end
+end
+
+-- ─── blob-ingest streaming (GAP-5) ───────────────────────────────────────────
+-- A streaming finder over a HUGE tree (millions of paths) hands the producer's raw stdout bytes straight to
+-- the native matcher instead of materialising every path as a Lua string/table (which is what caused the
+-- string-intern + GC pauses of a ~2M-candidate pool). The candidate POOL lives entirely native; only the
+-- ranked top-K rows are ever materialised on the Lua side. These thin wrappers expose the engine's blob API
+-- to the picker's `build()` and layer the config sort + result cap on top of the raw match — the blob analog
+-- of `M.filter`. All gated on `M.has_blob()`; an older .so keeps the current per-string path.
+
+--- Whether the native library supports blob ingestion (ABI ≥ 5). When false, the finders keep the per-string
+--- streaming path.
+---@return boolean
+function M.has_blob()
+    return engine.has_blob()
+end
+
+--- Create a blob-ingest context (nil when unavailable — the caller then uses the per-string path).
+---@return LvimFuzzyBlob?
+function M.blob_new()
+    return engine.blob_new()
+end
+
+--- Ingest a raw stdout chunk into `blob`; returns the new candidate count.
+---@param blob LvimFuzzyBlob
+---@param data string
+---@return integer
+function M.blob_append(blob, data)
+    return engine.blob_append(blob, data)
+end
+
+--- Flush the trailing partial line at end of stream; returns the candidate count.
+---@param blob LvimFuzzyBlob
+---@return integer
+function M.blob_flush(blob)
+    return engine.blob_flush(blob)
+end
+
+--- The current candidate count of `blob`.
+---@param blob LvimFuzzyBlob
+---@return integer
+function M.blob_count(blob)
+    return engine.blob_count(blob)
+end
+
+--- Free a blob context (native memory reclaimed).
+---@param blob LvimFuzzyBlob?
+function M.blob_free(blob)
+    engine.blob_free(blob)
+end
+
+--- Rank `blob` against `query` and hand the ranked results (`{ idx, text }`, `idx` = the 1-based NATIVE
+--- candidate index, `text` materialised for rendering / sorting) to `cb`, plus `total` = the TRUE number of
+--- candidates that matched (before the `max_results` cap; the whole pool for an empty query) so the finder can
+--- show an accurate `matched/total` counter rather than the ≤`max_results` shown-row count. Applies
+--- `config.max_results` and the config sort (dirs_first / ext / …). Match POSITIONS are NOT computed here — the
+--- caller lights up the query chars for its VISIBLE rows only, so a broad query over a huge pool never builds
+--- highlight spans for rows no one sees.
+---@param blob LvimFuzzyBlob
+---@param query string
+---@param cb fun(list: { idx: integer, text: string }[], total: integer)
+function M.blob_filter(blob, query, cb)
+    local max = (config or {}).max_results or 1000
+    engine.blob_match(blob, query, function(results, cnt, total)
+        local lim = math.min(cnt, max)
+        local ranked = {}
+        for k = 1, lim do
+            local idx = results[k].index
+            ranked[k] = { idx = idx, text = engine.blob_text(blob, idx) or "" }
+        end
+        cb(
+            apply_sort(ranked, function(r)
+                return r.text
+            end),
+            total or lim
+        )
+    end)
 end
 
 return M

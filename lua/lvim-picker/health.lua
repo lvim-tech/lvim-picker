@@ -43,7 +43,29 @@ function M.check()
 
     -- The matching engine of the tint (Lua-list) backend: prepared-context ranking through lvim-fuzzy.
     if has("lvim-fuzzy") then
-        ok(("lvim-fuzzy engine is available (backend: %s)"):format(require("lvim-fuzzy").backend()))
+        local lf = require("lvim-fuzzy")
+        ok(("lvim-fuzzy engine is available (backend: %s)"):format(lf.backend()))
+        -- Incremental append (ABI 2) keeps typing cheap WHILE a stream feeds a huge tree: each growth
+        -- appends only the new tail. An ABI-1 .so still works but re-prepares the whole pool per growth.
+        if lf.native_loaded() and not lf.has_append() then
+            warn(
+                "lvim-fuzzy .so is ABI 1 (no incremental append) — a stream-fed pool re-prepares on growth; "
+                    .. "rebuild it with `sh native/build.sh` for append support"
+            )
+        end
+        -- Blob ingestion (ABI 5) is the fast streaming path for files / directories / git_files: raw stdout
+        -- goes straight to the matcher, so a multi-million-file tree never builds a Lua string pool (no GC
+        -- pauses). Without it those finders still work via the per-string streaming path (paced, a bit slower).
+        if lf.native_loaded() then
+            if lf.has_blob and lf.has_blob() then
+                ok("lvim-fuzzy blob ingestion (ABI ≥ 5) — huge streamed trees load without a Lua candidate pool")
+            else
+                info(
+                    "lvim-fuzzy .so predates blob ingestion (ABI < 5) — streamed finders use the per-string path; "
+                        .. "rebuild it with `sh native/build.sh` for the zero-Lua-pool streaming path"
+                )
+            end
+        end
     else
         err("lvim-fuzzy not found — lvim-picker ranks every finder through it (install lvim-tech/lvim-fuzzy)")
     end

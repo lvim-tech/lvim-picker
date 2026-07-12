@@ -260,6 +260,7 @@ end
 ---@field preview? fun(item: table): string[], string?, integer?  preview lines (+ filetype, + focus line)
 ---@field on_confirm fun(item: table)  called with the chosen item
 ---@field on_cancel? fun()  called when dismissed without a choice
+---@field reopen? fun(backend: "fzf"|"tint")  installed by the finder (with_backend_swap); the C-] swap key exits fzf and `finish` calls it to reopen the finder in the tint list
 ---@field keys? { key: string, name?: string, mode?: "t"|"n", run: fun(item: table, close: fun()) }[]  per-call ROW ACTIONS on the focused item (e.g. open in a split); `mode` limits the key to insert ("t") / NORMAL ("n"), default both; `close` dismisses the picker
 ---@field empty_preview? string  the "nothing to preview" placeholder bar text (default "Nothing to preview")
 ---@field layout? "float"|"bottom"|"area"
@@ -626,6 +627,10 @@ function M.open(opts)
             expect_methods[#expect_methods + 1] = fk
         end
     end
+    -- Backend SWAP key (C-]): reopen this finder in the tint list. fzf `--expect`s it so it exits + prints the
+    -- key, and `finish` routes it to `opts.reopen` (installed by the finder). Only when the finder supports it.
+    local swap_key = keylist(kcfg.swap_backend or {})[1]
+    local swap_fk = (opts.reopen and swap_key and swap_key ~= "") and fzfkey(swap_key) or nil
     -- `start_fzf` is defined further down; forward-declared so `finish` (above it) can restart it IN PLACE for a
     -- keep-open dock (open a file without tearing the frame down → no flicker).
     local start_fzf
@@ -661,7 +666,7 @@ function M.open(opts)
         local was_normal = state.normal
         -- Parse the selection FIRST (no zone ops). `--expect` prints the pressed key as line 1 whenever ANY expect
         -- key is registered (the quickfix key OR an open-method key); a plain accept prints "".
-        local has_expect = qf_key ~= nil or #expect_methods > 0
+        local has_expect = qf_key ~= nil or #expect_methods > 0 or swap_fk ~= nil
         local key, items = "", {}
         if code == 0 and lines and #lines > 0 then
             local start = 1
@@ -674,6 +679,15 @@ function M.open(opts)
                     items[#items + 1] = lines[i]
                 end
             end
+        end
+        -- BACKEND SWAP (C-]): the finder is being reopened in the tint list — don't open/close normally; hand off
+        -- to `opts.reopen("tint")`, which routes through the dock and REPLACES this fzf entry in place. Scheduled
+        -- so it runs after this exit callback unwinds.
+        if swap_fk and key == swap_fk and opts.reopen then
+            vim.schedule(function()
+                opts.reopen("tint")
+            end)
+            return
         end
         -- Route the accept key → a method: the quickfix key → the quickfix list; a --expect open-method key →
         -- vsplit / hsplit / tab; anything else (incl. the plain "") → edit in the opener.
@@ -840,6 +854,9 @@ function M.open(opts)
         end
         for _, fk in ipairs(expect_methods) do
             expect[#expect + 1] = fk
+        end
+        if swap_fk then -- the backend-swap key (C-]) → fzf exits, `finish` reopens the tint list
+            expect[#expect + 1] = swap_fk
         end
         if #expect > 0 then
             args[#args + 1] = "--expect=" .. table.concat(expect, ",")

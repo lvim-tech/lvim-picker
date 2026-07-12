@@ -3,10 +3,12 @@
 -- INPUT band on top (a surface header input), a results LIST panel on the left and a scrollable PREVIEW
 -- panel on the right — the diagnostics-peek layout, but fuzzy. The MATCHING ENGINE is lvim-fuzzy — the
 -- shared native matcher of the lvim-tech set (in-process FFI; its own pure-Lua fallback when the .so is
--- absent): the candidate set is prepared once per pool, each keystroke is one match call, and the surface
--- renders the result. So ranking is lvim-fuzzy's exactly while WE own the view (engine vs view, like the
--- blink integration). Highlight positions are computed locally (lvim-utils.utils.match_indices — the engine
--- emits indices+scores only), so the matched characters light up in the list.
+-- absent): the candidate set is prepared once per pool (a stream-grown pool appends only its tail), each
+-- keystroke is one match call, and the surface renders the result. So ranking is lvim-fuzzy's exactly while
+-- WE own the view (engine vs view, like the blink integration). Highlight positions are computed locally
+-- (lvim-utils.utils.match_indices — the engine emits indices+scores only), so the matched characters light
+-- up in the list. The LIST is viewport-virtualized: the buffer holds only the visible window of rows, so a
+-- render is O(viewport) at any scale (see the viewport block in `build`).
 --
 ---@module "lvim-picker"
 
@@ -27,6 +29,7 @@ local dir_list_cmd = source.dir_list_cmd
 local read_preview = source.read_preview
 local run_lines = source.run_lines
 local spawn_stream = source.spawn_stream
+local spawn_stream_raw = source.spawn_stream_raw
 
 --- How many lines a location/grep preview must read to always include the FOCUS line: the default 500 cap
 --- plus a screenful of context below it, so a match DEEP in a large file previews at the right spot instead of
@@ -42,8 +45,14 @@ end
 --- When present, those finders let the real fzf TUI own the list (instant over huge trees, continuous live
 --- updates); the structured finders (lsp / diagnostics / …) always use the tint-striped list below.
 ---@return table?
-local function fzf_backend()
-    if (config or {}).fzf_tui == false then
+--- @param opts? table  a per-call `opts.backend = "fzf"|"tint"` FORCES the backend (used by the C-]/C-[ swap);
+--- nil defers to `config.fzf_tui`.
+local function fzf_backend(opts)
+    local force = opts and opts.backend
+    if force == "tint" then
+        return nil
+    end
+    if force ~= "fzf" and (config or {}).fzf_tui == false then
         return nil
     end
     local ok, b = pcall(require, "lvim-picker.fzf")
@@ -57,6 +66,36 @@ local M = {}
 -- branch through it, so both backends dock through the SAME layer.
 local open_fzf
 
+--- Reopen the CURRENT finder in the OTHER backend (tint ⇄ fzf) — bound to the swap keys INSIDE the picker only
+--- (never global). Each command-driven finder installs an `opts.reopen(backend)` closure that re-invokes ITSELF
+--- with the backend forced, capturing its ORIGINAL opts (before the per-backend spec was merged in) so no
+--- backend's spec fields leak into the other's open. The reopen routes through the dock, which REPLACES the
+--- live entry of that kind in place. `cur` is the backend the swap fires FROM; the query is not carried (retype).
+---@param cur "tint"|"fzf"
+---@param opts table
+local function swap_backend(cur, opts)
+    if type(opts.reopen) ~= "function" then
+        vim.notify("lvim-picker: this finder has no alternate backend", vim.log.levels.INFO)
+        return
+    end
+    opts.reopen((cur == "fzf") and "tint" or "fzf")
+end
+
+--- Install `opts.reopen(backend)` on a command-driven finder so the swap keys can re-open it in the OTHER
+--- backend. Captures the finder's CLEAN opts (its key + user fields — BEFORE the per-backend spec is merged in),
+--- dispatching by `opts.key` (== its `M.<kind>` entry name), so no backend's spec leaks into the other's open.
+--- Call at the finder's entry, right after `opts.key`.
+---@param opts table
+local function with_backend_swap(opts)
+    opts.reopen = opts.reopen
+        or function(backend)
+            local fn = opts.key and M[opts.key]
+            if type(fn) == "function" then
+                fn(vim.tbl_extend("force", opts, { backend = backend }))
+            end
+        end
+end
+
 --- Route a Lua-ITEM finder through the fzf-TUI backend when available, else the tint list — so EVERY finder
 --- shares one backend (only the structured lsp/diagnostics lists stay tint). Each item is encoded as
 --- `idx\ttext`; fzf shows/matches only the text (`--with-nth`), and the idx recovers the full item on
@@ -64,7 +103,7 @@ local open_fzf
 ---@param spec { title: string, items: table[], icon?: boolean, preview?: function, on_confirm?: function, on_cancel?: function, opts?: table }
 local function pick_items(spec)
     local items = spec.items or {}
-    local b = fzf_backend()
+    local b = fzf_backend(spec.opts)
     if b then
         local contents = {}
         for i, it in ipairs(items) do
@@ -115,21 +154,20 @@ local function normalize(items, format)
             -- shifts the highlighted spans.
             out[i] = { text = (it:gsub("[\r\n]+", " ")), _src = it }
         else
-            local item = {
-                text = (tostring((format and format(it)) or it.text or tostring(it)):gsub("[\r\n]+", " ")),
+            local t = (format and format(it)) or it.text
+            if type(t) ~= "string" then
+                t = tostring(t or it)
+            end
+            -- NOTE: items WITHOUT an explicit `icon` get their ft devicon LAZILY, per VISIBLE row, in the
+            -- list render (see the viewport loop) — never here. normalize runs over the WHOLE candidate set
+            -- (~2M rows when a huge tree streams in) and the uncached devicon lookup (~3 µs/row) was over
+            -- half the per-row ingest cost, for icons only a ~20-row viewport ever shows.
+            out[i] = {
+                text = (t:gsub("[\r\n]+", " ")),
                 icon = it.icon,
                 icon_hl = it.icon_hl,
                 _src = it,
             }
-            -- auto ft devicon for items that name a file (lsp locations / diagnostics / quickfix / jumplist /
-            -- file lists) on the tint backend — drawn as a coloured extmark; the fzf backend gets the ANSI icon.
-            if not item.icon then
-                local p = it.path or (it.bufnr and api.nvim_buf_is_valid(it.bufnr) and api.nvim_buf_get_name(it.bufnr))
-                if p and p ~= "" then
-                    item.icon, item.icon_hl = source.devicon(p)
-                end
-            end
-            out[i] = item
         end
     end
     return out
@@ -454,15 +492,30 @@ local function get_consumer(kind, layout)
     return c
 end
 
+---@class LvimPickerGrepSpec
+---@field live boolean  true = the typed query DRIVES rg (re-grep per keystroke); false = a one-shot fixed-query grep
+---@field query? string  the fixed rg query (when `live = false`) — grepped ONCE, then the typed query fuzzy-filters the blob
+---@field regex? boolean  treat the query as a regex (default false = literal `--fixed-strings`)
+---@field file? string  restrict the search to this single file (the curbuf grep)
+---@field min_chars? integer  minimum typed chars before a live grep runs rg (default 2 — rg over a huge tree is heavy)
+
 ---@class LvimPickerOpts
 ---@field items? any[]  STATIC candidates (strings, or tables — see `format`), fuzzy-filtered as you type
 ---@field source? fun(query: string, cb: fun(items: any[]))  a LIVE source: each query produces the results (e.g. ripgrep); use instead of `items`
+---@field source_raw? boolean  the `source` cb already delivers GRID items (`{ text, _src, … }`), so skip normalising them — for a progressive source that appends into one growing list (live grep)
+---@field backend? "fzf"|"tint"  PER-CALL backend force (used by the C-] swap): "fzf" = the fzf TUI, "tint" = the Lua list; nil = defer to `config.fzf_tui`
+---@field reopen? fun(backend: "fzf"|"tint")  installed by `with_backend_swap` on the command finders; the C-] swap key calls it to reopen this finder in the other backend
+---@field count_files? boolean  count the tree's files in the background (via the files list command) and use it as the counter's TOTAL — grep shows `matches found / total files`
 ---@field stream? fun(feed: fun(raw: any[]), done: fun()): fun()  an ASYNC streaming producer (e.g. `fd`): feeds candidates in incrementally; returns a cancel fn
+---@field blob_stream? fun(feed_bytes: fun(data: string), done: fun()): fun()  a RAW-BYTE streaming producer (GAP-5): feeds stdout chunks straight to the native matcher (no Lua per-row work); needs `blob_item`; requires ABI ≥ 5
+---@field blob_item? fun(text: string): table  derive a candidate's `_src` item from its text (path) for the blob-stream path (e.g. `function(t) return { path = t } end`)
+---@field grep? LvimPickerGrepSpec  the GREP controller (Variant B): hold ALL rg matches in the native blob; the MODE (grep|filter) decides whether the typed query drives rg or fuzzy-filters the frozen blob; requires ABI ≥ 5
 ---@field on_confirm fun(item: any)  called with the chosen item's source value
 ---@field on_cancel? fun()  called when the finder is dismissed without a choice (incl. replaced by the next finder)
 ---@field on_close? fun()  finder-owned teardown run on close (e.g. a live source killing its in-flight process)
 ---@field format? fun(item: any): string  display text for a table item (default: `item.text`)
----@field preview? fun(item: any): string[], string?, integer?  preview lines (+ a filetype, + a 1-based focus line) per selection
+---@field preview? fun(item: any): string[], string?, integer?  preview lines (+ a filetype, + a 1-based focus line) per selection (SYNCHRONOUS, in-memory finders)
+---@field preview_file_of? fun(item: any): { path: string, lnum?: integer, ft?: string }?  map an item to a FILE location previewed ASYNC (read off the main thread, LRU-cached) so the preview follows the cursor while scrolling; used by files/grep
 ---@field preview_file? boolean  preview the item's REAL file buffer (EDITABLE, 2-way synced) instead of `preview` lines; items need `path` (+ lnum/col)
 ---@field preview_side? "right"|"left"|"below"|"above"|"dynamic"|"hide"  where the preview sits (default "right"); below/above stack; `dynamic` = full-width list + a peek float above (native-qf style); `hide` = no preview (toggle with <C-e>)
 ---@field preview_numbers? boolean  show line numbers in the preview (default true)
@@ -516,6 +569,9 @@ build = function(opts, kind)
     local state = {
         filtered = items,
         sel = 1,
+        -- Logical index of the FIRST rendered list row (viewport virtualization): the list buffer holds only
+        -- the visible window (+ a small margin), never all filtered rows — see the viewport block below.
+        view_top = 1,
         list_pan = nil,
         preview_pan = nil,
         st = nil,
@@ -586,6 +642,10 @@ build = function(opts, kind)
     -- Forward declarations — the list panel's NORMAL-mode keys (defined with the panel, early) call these,
     -- but they are assigned further down (after the providers/state are wired).
     local move, confirm, cancel, focus_input, act, scroll_preview
+    local build_footer -- mode-aware footer legend (prompt ⇄ list), assigned near focus_input; used at open + on switch
+    -- The GREP controller (assigned after `refilter`, referenced by it + the keymaps): (re)start rg for a query,
+    -- stop the in-flight rg, and the Ctrl-g grep⇄filter toggle. Nil for non-grep finders.
+    local grep_start, grep_stop, grep_toggle
 
     -- ── multi-select marking + quickfix (config.keys.mark / .quickfix, shared with the fzf backend) ──
     local pkc = (config or {})
@@ -678,8 +738,59 @@ build = function(opts, kind)
     -- chassis owns that publish, not us). `count_fn` is the live `matches / candidate-pool` count (fzf-lua
     -- style: the pool grows as a stream feeds in); `refresh_count` re-applies it to the live border / overlay
     -- after every selection move / filter / type.
+    -- The counter, always the REAL numbers (never the ≤max_results shown-row count). The two numbers only ever
+    -- differ when a QUERY is actually narrowing a pool, so:
+    --   • NO query → a SINGLE number (the pool count) — with nothing typed, "found == total" is meaningless, so
+    --     we show just the count (a plain number renders as "N", not "N/N").
+    --   • a query → `matched / total`, where MATCHED is the matcher's TRUE hit count (shrinks as you narrow),
+    --     TOTAL the fixed pool.
+    --   • LIVE grep → always a SINGLE number: rg IS the search (there is no separate pool to narrow against),
+    --     so every found row is a matched row — a lone climbing match count is the honest display.
     local function count_fn()
-        return { current = state.filtered and #state.filtered or 0, total = #items }
+        -- GREP CONTROLLER (Variant B): the blob holds ALL rg matches (up to the config.grep_max store ceiling; a
+        -- pathological overflow is still TALLIED, never stored). The MODE decides the counter:
+        --   • GREP mode — rg IS the search, nothing filters on top, so matched == total == the REAL rg match
+        --     count (`state.grep_total`, climbing to e.g. 403127 as rg streams) → shown fzf-style `N/N`.
+        --   • FILTER mode (rg frozen; the typed query fuzzy-narrows the loaded blob) — `matched / loaded`, where
+        --     matched (`state.match_total`, the matcher's TRUE hit count) SHRINKS as you type and `loaded`
+        --     (`state.pool_n`) is the blob's candidate count.
+        if opts.grep then
+            if state.grep_mode == "filter" then
+                local total = state.pool_n or 0
+                return { current = state.match_total or total, total = total }
+            end
+            local n = state.grep_total or 0
+            return n > 0 and { current = n, total = n } or 0
+        end
+        -- GREP (opts.count_files): `matches found / TOTAL FILES in the tree`. `current` = the grep matches (the
+        -- fuzzy-narrowed hit count on the fixed-query/blob path, or the live-grep result count); `total` = the
+        -- tree's file count (state.file_total, streamed in the background — see the file-count block). This is
+        -- the denominator the user wants: how many files the grep searched, not the match count repeated.
+        if opts.count_files then
+            local cur
+            if state.blob then
+                cur = state.query == "" and (state.pool_n or 0) or (state.match_total or state.pool_n or 0)
+            else
+                cur = state.filtered and #state.filtered or 0
+            end
+            return { current = cur, total = state.file_total or cur }
+        end
+        if state.blob then
+            local total = state.pool_n or 0
+            if state.query == "" then
+                return total -- no filter → just the count
+            end
+            return { current = state.match_total or total, total = total }
+        end
+        if opts.source then
+            local cur = state.filtered and #state.filtered or 0
+            return { current = cur, total = cur }
+        end
+        local cur = state.filtered and #state.filtered or 0
+        if state.query == "" then
+            return #items -- no filter → just the count
+        end
+        return { current = cur, total = #items }
     end
     local function refresh_count()
         if state.st and state.st.set_counter then
@@ -714,6 +825,16 @@ build = function(opts, kind)
             end
             return 1
         end
+        if opts.preview_file_of then
+            -- ASYNC file preview: track the LIST height (the result COUNT, capped at max_rows) — NOT the
+            -- previewed file's own line count. The file count would change for EVERY row as you scroll →
+            -- `content_h` re-fingerprints → a `relayout()` on every scroll step that visibly tears the windows.
+            -- The result count is STABLE while scrolling (it only changes on a new query), so this keeps the
+            -- layout put during scroll (no tear) AND still AUTO-FITS the panel to the number of matches — a
+            -- few-result grep gets a compact panel instead of a full-height one (the preview shows that many
+            -- context rows). Identical to `list_h()` so the two panels always agree.
+            return list_h()
+        end
         return math.min(#state.preview_lines, maxr)
     end
     --- True when the filter left at least one result (drives the winbar / empty-state rendering).
@@ -734,6 +855,43 @@ build = function(opts, kind)
     end
     local function content_h()
         return list_h() * 1000 + preview_h()
+    end
+
+    -- ── list viewport (virtualized render) ──────────────────────────────────
+    -- The list buffer holds ONLY the rows its window can show (+ VIEW_MARGIN below), never the whole
+    -- filtered set — so a render is O(viewport) at ANY scale (an uncapped live-grep result or a huge static
+    -- `items` open used to build every row + stripe extmark: 0.4–1.6 s and ~600k extmarks at 200k).
+    -- Selection, marks and actions keep addressing LOGICAL entries (`state.filtered[state.sel]`); only the
+    -- buffer-line mapping shifts by `state.view_top - 1` (each entry is exactly ONE buffer line — `normalize`
+    -- collapses newlines). Row striping is keyed by the LOGICAL index, so the odd/even pattern stays put
+    -- while scrolling instead of re-phasing with the slice.
+    local VIEW_MARGIN = 4 -- overrender a few rows so the window height (winbar / relayout skew) never shows blanks
+    --- The list viewport height: the live window height when the panel exists (a docked layout can exceed
+    --- `max_rows`), else the content-fit height. May overcount by the winbar row — VIEW_MARGIN covers it.
+    ---@return integer
+    local function view_height()
+        local p = state.list_pan
+        if p and p.win and api.nvim_win_is_valid(p.win) then
+            return math.max(1, api.nvim_win_get_height(p.win))
+        end
+        return math.max(1, list_h())
+    end
+    --- Clamp `state.view_top` so the selection sits inside the viewport and the slice never starts past the
+    --- tail. Called at the top of every list render — every path (move / filter / stream growth) goes
+    --- through the render, so the slice can never drift from the selection.
+    ---@param vh integer  the viewport height
+    ---@return integer view_top
+    local function clamp_view(vh)
+        local total = #state.filtered
+        local top = state.view_top or 1
+        if state.sel < top then
+            top = state.sel
+        elseif state.sel > top + vh - 1 then
+            top = state.sel - vh + 1
+        end
+        top = math.max(1, math.min(top, math.max(1, total - vh + 1)))
+        state.view_top = top
+        return top
     end
 
     -- Each panel carries a WINBAR title, the lvim-lsp peek look: the list shows the title + result count,
@@ -831,12 +989,50 @@ build = function(opts, kind)
         end,
         render = function()
             local lines, hls = {}, {}
-            for i, it in ipairs(state.filtered) do
+            -- VIEWPORT: build only the visible slice (+ margin) — O(viewport) regardless of #filtered.
+            local vh = view_height()
+            local top = clamp_view(vh)
+            local last = math.min(#state.filtered, top + vh + VIEW_MARGIN - 1)
+            for li = top, last do
+                local it = state.filtered[li]
+                local i = li - top + 1 -- 1-based BUFFER line of logical entry `li`
                 local marked = is_marked(it._src)
+                -- LIVE-source rows (e.g. live grep): the query-highlight decoration is computed HERE, for the
+                -- visible rows only — never over the whole result set (rg did the real matching; this only
+                -- lights the query chars up). Result items are fresh tables per delivery, so the memo
+                -- (`_match_done`) can never carry a stale query's spans.
+                -- LIVE-source AND blob-stream rows carry no precomputed match spans (an eager pass over the
+                -- whole result set was O(all results) per keystroke); light up the query chars HERE, for the
+                -- visible rows only. Result items are fresh tables per delivery, so `_match_done` never carries
+                -- a stale query's spans.
+                if (opts.source or state.blob) and not it._match_done then
+                    local q = state.live_query
+                    if q and q ~= "" then
+                        it.match = utils.match_indices(q, it.text)
+                    end
+                    it._match_done = true
+                end
+                -- Auto ft devicon for items that name a file (file lists / lsp locations / quickfix / …),
+                -- resolved HERE — for the visible rows only — because the lookup is uncached ~3 µs/call and
+                -- `normalize` runs over the whole candidate set (~2M rows on a huge tree). Memoised per grid
+                -- item (`_icon_done`); grid items are fresh tables per filter delivery, so a re-resolve is at
+                -- most one viewport per keystroke. An EXPLICIT item icon (e.g. a diagnostic severity glyph)
+                -- arrives non-nil from normalize and is left untouched.
+                if it.icon == nil and not it._icon_done then
+                    it._icon_done = true
+                    local s = it._src
+                    if type(s) == "table" then
+                        local p = s.path
+                            or (s.bufnr and api.nvim_buf_is_valid(s.bufnr) and api.nvim_buf_get_name(s.bufnr))
+                        if p and p ~= "" then
+                            it.icon, it.icon_hl = source.devicon(p)
+                        end
+                    end
+                end
                 local row, spans, lead = list_row(it, marked, marker)
                 lines[i] = row
-                local odd = (i % 2) == 1
-                local sel = i == state.sel
+                local odd = (li % 2) == 1 -- stripe parity by LOGICAL index (stable while scrolling)
+                local sel = li == state.sel
                 local stripe = sel
                         and (odd and hl("sel_odd", "LvimUiMsgAreaSelOdd") or hl("sel_even", "LvimUiMsgAreaSelEven"))
                     or (odd and hl("row_odd", "LvimUiMsgAreaRowOdd") or hl("row_even", "LvimUiMsgAreaRowEven"))
@@ -899,6 +1095,16 @@ build = function(opts, kind)
                 -- preview is still reachable via `<C-l>`); both keys come from config.keys.
                 map(keylist(kcfg.mark), mark)
                 map(keylist(kcfg.quickfix), to_quickfix)
+                -- (grep) Ctrl-g toggles GREP ⇄ FILTER mode from the normal-mode list too.
+                if grep_toggle then
+                    map(keylist(kcfg.grep_filter), grep_toggle)
+                end
+                -- Swap the finder's backend (tint ⇄ fzf) from the normal list — command finders only.
+                if opts.reopen then
+                    map(keylist(kcfg.swap_backend), function()
+                        swap_backend("tint", opts)
+                    end)
+                end
                 -- back to typing: `/` + <C-f> (NOT i/a — a consumer filter may own those, e.g. diagnostics).
                 map({ "/", "<C-f>" }, focus_input)
                 map({ "q", "<Esc>" }, cancel)
@@ -942,17 +1148,23 @@ build = function(opts, kind)
         }
     end
     preview_provider = preview_provider
-        or opts.preview
+        or (opts.preview or opts.preview_file_of)
             and {
                 size = function()
                     -- Both panels share the CONTENT height (the taller of list/preview, capped) so the
-                    -- container fits the bigger one; the preview lines are cached in `state.preview_lines`
-                    -- (fetched on selection — see `fetch_preview`). With results +1 for the winbar; with NO
-                    -- results a single tinted `[no matches]` row.
+                    -- container fits the bigger one; the preview lines live in `state.preview_lines` (filled by
+                    -- the sync `fetch_preview` for in-memory finders, or ASYNC for file finders). With results
+                    -- +1 for the winbar; with NO results a single tinted `[no matches]` row.
                     return math.max(40, math.floor(vim.o.columns * 0.5)), preview_panel_h() -- the PREVIEW's own height
                 end,
                 update = function(pan)
-                    set_preview_winbar(pan, state.filtered[state.sel] and state.filtered[state.sel]._src or nil)
+                    -- The winbar shows the file that is ACTUALLY displayed: `state.preview_loc` (the async
+                    -- file-preview path sets which file landed — a row behind during a fast scroll), else the
+                    -- current selection's own source. Keeps the panel body + title consistent.
+                    set_preview_winbar(
+                        pan,
+                        state.preview_loc or (state.filtered[state.sel] and state.filtered[state.sel]._src) or nil
+                    )
                     -- No results: a SINGLE styled "nothing to preview" row (no winbar, no number, no syntax) —
                     -- the same bar `ui.preview` paints for the editable file preview, so the two read identically.
                     if not has_results() then
@@ -1005,12 +1217,20 @@ build = function(opts, kind)
     local function set_list_cursor()
         local p = state.list_pan
         if p and p.win and api.nvim_win_is_valid(p.win) then
-            pcall(api.nvim_win_set_cursor, p.win, { math.max(1, math.min(#state.filtered, state.sel)), 0 })
+            -- Map the LOGICAL selection to its buffer line in the rendered viewport slice (the render just
+            -- clamped `view_top`, so the selection is always inside the slice; clamp to the buffer anyway).
+            local row = state.sel - (state.view_top or 1) + 1
+            local nbuf = api.nvim_buf_line_count(p.buf)
+            pcall(api.nvim_win_set_cursor, p.win, { math.max(1, math.min(nbuf, row)), 0 })
         end
     end
-    --- Fetch the CURRENT selection's preview content into the cache (so `content_h`/`size` know its line
-    --- count before relayout, and `update` writes it). No preview, or no selection ⇒ empty.
+    --- Fetch the CURRENT selection's SYNCHRONOUS in-memory preview (lsp / diagnostics / buffers — cheap, no
+    --- disk). File-based previews (`opts.preview_file_of`) are read ASYNC below and must NOT be touched here
+    --- (this runs on every rerender and would wipe the async-loaded lines). No preview / no selection ⇒ empty.
     local function fetch_preview()
+        if opts.preview_file_of then
+            return -- the async file-preview path owns state.preview_lines
+        end
         if opts.preview_file or not opts.preview then
             -- the editable file preview owns its buffer (ui.preview); no scratch lines to cache
             state.preview_lines, state.preview_ft, state.preview_focus = {}, nil, nil
@@ -1035,59 +1255,312 @@ build = function(opts, kind)
             state.st.relayout()
         end
     end
-    --- Re-render everything after a selection or result change: refresh the preview cache, re-fit the height,
-    --- then re-render both panels + the chrome.
-    local function rerender()
-        fetch_preview()
+
+    -- ── ASYNC FILE PREVIEW (opts.preview_file_of) ─────────────────────────────
+    -- For finders whose preview is a FILE on disk (grep / files), the read runs OFF the main thread
+    -- (source.read_preview_async) so the preview can FOLLOW THE CURSOR while you hold `j` — a synchronous
+    -- readfile of a deep-line big file was the scroll freeze, and a settle-debounce only updated it on release.
+    -- An LRU cache keyed by PATH makes re-visiting a file instant (scrolling within one grep file, or back over
+    -- rows), and a SINGLE in-flight read that always re-targets the LATEST selection keeps the preview
+    -- converging on the current row like fzf (never a pile of parallel reads, never a stale frame kept).
+    local preview_cache = {} ---@type table<string, { lines: string[], ft: string }>
+    local preview_lru = {} ---@type string[]  MRU-ordered paths (index 1 = most recently used)
+    local preview_inflight = false
+    ---@type { sel: integer, path: string, lnum: integer?, ft: string?, max: integer }?
+    local preview_want
+    --- Look a file up in the LRU cache, promoting it to most-recent on a hit.
+    ---@param path string
+    ---@return { lines: string[], ft: string }?
+    local function cache_get(path)
+        local e = preview_cache[path]
+        if e then
+            for i, p in ipairs(preview_lru) do
+                if p == path then
+                    table.remove(preview_lru, i)
+                    break
+                end
+            end
+            table.insert(preview_lru, 1, path)
+        end
+        return e
+    end
+    --- Insert a file's preview lines into the LRU cache, evicting the least-recently-used beyond the configured
+    --- size so a long session never accumulates unbounded preview buffers.
+    ---@param path string
+    ---@param lines string[]
+    ---@param ft string
+    local function cache_put(path, lines, ft)
+        if not preview_cache[path] then
+            table.insert(preview_lru, 1, path)
+        end
+        preview_cache[path] = { lines = lines, ft = ft }
+        local cap = (config or {}).preview_cache or 32
+        while #preview_lru > cap do
+            local old = table.remove(preview_lru)
+            preview_cache[old] = nil
+        end
+    end
+    --- Show `entry`'s lines in the preview, focused on `want.lnum`. `state.preview_loc` records WHICH file is
+    --- shown (the render's winbar reads it), so the panel body + title stay consistent even when a read lands a
+    --- row or two behind a fast scroll (it converges as the pump reads the current selection next).
+    ---@param want { path: string, lnum: integer?, ft: string? }
+    ---@param entry { lines: string[], ft: string }
+    local function apply_async_preview(want, entry)
+        state.preview_lines = entry.lines
+        state.preview_ft = want.ft or entry.ft
+        state.preview_focus = want.lnum and math.max(1, math.min(want.lnum, #entry.lines)) or nil
+        state.preview_loc = { path = want.path, lnum = want.lnum }
+        refit() -- the preview height is capped at max_rows, so this relayouts only on the FIRST load, then holds
+        if state.preview_pan and state.preview_pan.refresh then
+            state.preview_pan.refresh()
+        end
+        set_list_winbar()
+    end
+    --- Drain the pending preview request: a cache hit applies instantly; a miss starts ONE async read (marking
+    --- `preview_inflight`) whose completion applies it, caches it, and pumps again — so the newest `preview_want`
+    --- is always what gets read next.
+    local function pump_preview()
+        if preview_inflight or not preview_want then
+            return
+        end
+        local want = preview_want
+        preview_want = nil
+        local hit = cache_get(want.path)
+        if hit then
+            apply_async_preview(want, hit)
+            return pump_preview() -- a newer selection may already be waiting
+        end
+        preview_inflight = true
+        source.read_preview_async(want.path, want.max, function(lines, ft)
+            preview_inflight = false
+            if state.closed then
+                return
+            end
+            cache_put(want.path, lines, ft)
+            apply_async_preview(want, { lines = lines, ft = ft })
+            pump_preview()
+        end)
+    end
+    --- Request the async preview for the CURRENT selection (the file `opts.preview_file_of` maps it to). No
+    --- file (e.g. a scratch/[No Name] item) ⇒ clear the preview.
+    local function request_preview()
+        local it = state.filtered[state.sel]
+        local loc = (it and it._src and opts.preview_file_of and opts.preview_file_of(it._src)) or nil
+        if not (loc and loc.path and loc.path ~= "") then
+            state.preview_lines, state.preview_ft, state.preview_focus, state.preview_loc = {}, nil, nil, nil
+            refit()
+            if state.preview_pan and state.preview_pan.refresh then
+                state.preview_pan.refresh()
+            end
+            return
+        end
+        -- Read up to `lnum + context` lines (so the match is on-screen), hard-capped at `preview_max_lines` so a
+        -- match DEEP in a huge file never materialises tens of thousands of lines on the main thread.
+        local span = math.max(500, (loc.lnum or 0) + 200)
+        local maxl = math.min(span, (config or {}).preview_max_lines or 2000)
+        preview_want = { sel = state.sel, path = loc.path, lnum = loc.lnum, ft = loc.ft, max = maxl }
+        pump_preview()
+    end
+
+    --- Re-render after a result / selection change. `light` (the frequent re-renders WHILE a tree streams in,
+    --- and every scroll MOVE) does the LIST + chrome only — O(viewport), no preview work, no relayout churn —
+    --- so it is always a couple ms. A FULL re-render (`light` nil) also drives the preview: the async file read
+    --- (opts.preview_file_of) or the synchronous in-memory fetch (opts.preview). The preview height is capped at
+    --- max_rows, so once it is loaded `refit()` is a no-op and scrolling never relayouts.
+    ---@param light boolean?
+    local function rerender(light)
+        if not light then
+            fetch_preview()
+        end
         refit()
         if state.list_pan and state.list_pan.refresh then
             state.list_pan.refresh()
         end
-        if state.preview_pan and state.preview_pan.refresh then
-            state.preview_pan.refresh()
+        if not light then
+            if opts.preview_file_of then
+                request_preview() -- async: fills state.preview_lines + refreshes the panel on completion
+            elseif state.preview_pan and state.preview_pan.refresh then
+                state.preview_pan.refresh()
+            end
         end
         set_list_winbar() -- the result count in the winbar follows the list
         set_list_cursor() -- scroll the window to keep the selection in view
         refresh_count() -- re-apply the live match count to the chassis border / overlay counter
+    end
+    -- SYNC-preview debounce (small in-memory finders — lsp / diagnostics / the editable file preview). Their
+    -- preview is cheap but a per-move relayout is still wasteful; debounce it to the settle. FILE finders do NOT
+    -- use this — their preview is async (request_preview) and follows the cursor on every move.
+    local preview_gen = 0
+    local function schedule_preview()
+        if opts.preview_file_of or not (opts.preview or opts.preview_file) then
+            return
+        end
+        preview_gen = preview_gen + 1
+        local mygen = preview_gen
+        vim.defer_fn(function()
+            if mygen ~= preview_gen or state.closed then
+                return
+            end
+            fetch_preview()
+            refit()
+            if state.preview_pan and state.preview_pan.refresh then
+                state.preview_pan.refresh()
+            end
+            set_list_winbar()
+        end, (config or {}).preview_debounce_ms or 60)
     end
     move = function(d)
         if #state.filtered == 0 then
             return
         end
         state.sel = math.max(1, math.min(#state.filtered, state.sel + d))
-        rerender() -- the preview (and so the height) changes with the selection
+        rerender(true) -- LIGHT: move the selection stripe + list cursor + count now (a couple ms, never blocks)
+        if opts.preview_file_of then
+            request_preview() -- async file preview — follows the cursor while holding `j` (fzf-like)
+        else
+            schedule_preview() -- debounced sync preview for the small in-memory finders
+        end
     end
-    --- Apply a new result list (from the fuzzy filter or a live source) to the UI.
+    --- Apply a new result list (from the fuzzy filter or a live source) to the UI. `light` forwards to
+    --- `rerender` — set for the high-frequency refreshes while a tree is still streaming (count + rows only).
+    --- POSITION: a QUERY CHANGE (`state.reset_pos`, set in `refilter`) jumps back to the top (sel=1, view_top=1)
+    --- — a new search starts at the best match. A same-query APPEND (a streaming refresh / a progressive grep
+    --- batch, where results only grow at the tail) PRESERVES the selection + viewport, clamped to the new
+    --- bounds — so browsing while results pour in stays put like fzf, instead of being yanked back to the top.
     ---@param list table[]
-    local function apply(list)
+    ---@param light boolean?
+    local function apply(list, light)
         if state.closed then
             return
         end
-        state.filtered, state.sel = list, 1
-        rerender()
+        state.filtered = list
+        -- Reset the scroll to the top only when the QUERY actually CHANGED since the last applied list — a new
+        -- search starts at the best match. Progressive/streaming refreshes of the SAME query (a live-grep batch,
+        -- a files stream tick — possibly MANY per one `refilter`) keep the selection + viewport, clamped to the
+        -- grown list, so browsing while results pour in stays put like fzf.
+        if state.query ~= state.rendered_query then
+            state.sel, state.view_top = 1, 1
+        else
+            local n = math.max(1, #list)
+            state.sel = math.max(1, math.min(state.sel or 1, n))
+            state.view_top = math.max(1, math.min(state.view_top or 1, n))
+        end
+        state.rendered_query = state.query
+        rerender(light)
+    end
+    --- (blob stream) Turn `fuzzy.blob_filter` results (`{ idx, text }`, `idx` = the 1-based NATIVE candidate
+    --- index) into grid rows. The `_src` item is DERIVED from the text via `opts.blob_item` and CACHED by
+    --- native index in `state.src_cache`, so the SAME candidate always yields the SAME `_src` table — a stable
+    --- identity across refilters that multi-select marks (keyed by `_src`) rely on. Text is carried on the row;
+    --- the icon (from `_src.path`) and the match spans are resolved lazily in the render, for visible rows only.
+    ---@param list { idx: integer, text: string }[]
+    ---@return table[]
+    local function blob_rows(list)
+        local cache = state.src_cache
+        local out = {}
+        for i, r in ipairs(list) do
+            local src = cache[r.idx]
+            if not src then
+                src = opts.blob_item(r.text)
+                cache[r.idx] = src
+            end
+            out[i] = { text = r.text, _src = src, idx = r.idx }
+        end
+        return out
     end
     -- A generation guard so a slow async source/filter callback for an OLD query can't overwrite a newer one.
     local refilter_gen = 0
     --- Re-run the filter (static list) or live source for query `q`, then push the ranked results to the UI.
+    --- `light` is set by the stream feed for the many-per-second refreshes while a tree loads → a cheap re-render
+    --- (count + rows, no preview / relayout); user-driven refilters leave it nil for a full re-render.
     ---@param q string?
-    local function refilter(q)
+    ---@param light boolean?
+    local function refilter(q, light)
         state.query = q or ""
         refilter_gen = refilter_gen + 1
         local mygen = refilter_gen
         local function guarded(list)
             if mygen == refilter_gen then
-                -- A live source returns raw items (no fuzzy step), so highlight the query in each result text
-                -- ourselves (the matched chars light up like the static path).
-                local norm = normalize(list, opts.format)
-                if state.query ~= "" then
-                    for _, it in ipairs(norm) do
-                        it.match = utils.match_indices(state.query, it.text)
-                    end
-                end
-                apply(norm)
+                -- A live source returns raw items (no fuzzy step), so the query is highlighted in each result
+                -- text ourselves — but LAZILY, in the list render, for the VISIBLE rows only (an eager pass
+                -- here was O(all results) per keystroke). `live_query` records which query produced THIS
+                -- result set (gen-guarded), so the render decorates against the right needle.
+                state.live_query = state.query
+                -- `source_raw`: the source already delivers grid items (a live grep appends into ONE growing
+                -- list — see the progressive delivery), so DON'T re-normalise the whole (up to grep_max) list on
+                -- every progressive batch — that O(n) re-wrap per delivery was the live-grep stutter. Otherwise
+                -- normalise the raw items once here.
+                apply(opts.source_raw and list or normalize(list, opts.format), light)
             end
         end
-        if opts.source then
+        if opts.grep then
+            -- GREP CONTROLLER (Variant B). The blob holds ALL rg matches; the MODE decides what the typed query
+            -- does. GREP mode: the query DRIVES rg (re-grep into a fresh blob on a real change), and the blob is
+            -- rendered in SOURCE ORDER (blob_filter "") — every match browsable, the counter the true rg total.
+            -- FILTER mode (Ctrl-g froze rg): the query FUZZY-FILTERS the loaded blob (blob_filter `query`), the
+            -- counter `matched/loaded`. `live_query` is the typed text either way, so the render lights up the
+            -- needle (grep) / the fuzzy term (filter) in the VISIBLE rows only.
+            if state.grep_mode == "grep" then
+                local q = state.query
+                if #q < (opts.grep.min_chars or 2) then
+                    grep_stop() -- too short to grep a huge tree → clear the list + counter, wait for more chars
+                    state.grep_query, state.grep_total = q, 0
+                    apply({}, light)
+                    return
+                end
+                if q ~= state.grep_query then
+                    -- A NEW query → (re)grep into a FRESH (empty) blob; its paced stream ticks call `refilter`
+                    -- again (same query) as matches arrive, and THAT is what renders. Do NOT render the empty
+                    -- fresh blob here — keep the CURRENT rows on screen until the new results stream in, so
+                    -- re-typing a live grep never flashes an empty list between keystrokes (fzf keeps its rows the
+                    -- same way while it reloads). Without this, every keystroke cleared the list → the flicker.
+                    grep_start(q)
+                    return
+                end
+                -- Same query = a stream tick (or a manual refresh): render the (growing) blob in source order.
+                state.live_query = q
+                if state.blob then
+                    fuzzy.blob_filter(state.blob, "", function(list, total)
+                        if mygen == refilter_gen then
+                            -- Do NOT blank the list while a fresh (re)grep is still streaming its first matches:
+                            -- an EMPTY pass with an empty pool and rg not yet done = "results are coming", not
+                            -- "no matches". Keep the CURRENT rows until real matches arrive (or rg finishes
+                            -- empty). This is what makes a Ctrl-g FILTER→GREP return smooth — no empty flash.
+                            if #list == 0 and (state.pool_n or 0) == 0 and not state.grep_done then
+                                return
+                            end
+                            state.match_total = total
+                            apply(blob_rows(list), light)
+                        end
+                    end)
+                end
+                return
+            end
+            -- FILTER mode: fuzzy-filter the FROZEN blob (rg not re-run).
+            state.live_query = state.query
+            if state.blob then
+                fuzzy.blob_filter(state.blob, state.query, function(list, total)
+                    if mygen == refilter_gen then
+                        state.match_total = total
+                        apply(blob_rows(list), light)
+                    end
+                end)
+            end
+            return
+        end
+        if state.blob then
+            -- BLOB STREAM (GAP-5): the candidate POOL lives entirely in the native matcher — there is no Lua
+            -- `items` array to fuzzy over. Rank the native pool and materialise ONLY the ranked top-K rows
+            -- (their text pulled from the blob by index). `live_query` records which query produced this set so
+            -- the render lights up the query chars for the VISIBLE rows only (like the live-source path).
+            state.live_query = state.query
+            fuzzy.blob_filter(state.blob, state.query, function(list, total)
+                if mygen == refilter_gen then
+                    state.match_total = total -- the TRUE matched count (before max_results) → the live counter
+                    apply(blob_rows(list), light)
+                end
+            end)
+        elseif opts.source then
             -- LIVE source: the query drives the results (e.g. ripgrep) — no fuzzy over a static list.
             opts.source(state.query, guarded)
         else
@@ -1124,10 +1597,148 @@ build = function(opts, kind)
             end
             filter(pool, state.query, function(list)
                 if mygen == refilter_gen then
-                    apply(list)
+                    apply(list, light)
                 end
             end)
         end
+    end
+    -- ── GREP controller (Variant B: hold ALL rg matches in the native blob) ──────────────────────────────────
+    -- Only assigned for a grep finder (opts.grep). The blob is RE-CREATED per grep query (a new needle = a new
+    -- candidate set, so native indices restart at 1 and the src-cache must be cleared with it). rg streams into
+    -- the blob paced + bounded: up to `config.grep_max` candidates are STORED and browsable; a broader-than-that
+    -- query is still fully COUNTED (the tally in source.spawn_grep_blob) so the counter shows the real total
+    -- without ever buffering past the ceiling. Killed on close / on a re-grep / on the Ctrl-g freeze.
+    if opts.grep then
+        ---@type fun()?  the in-flight rg's cancel (kills rg + drops its queued backlog)
+        local grep_cancel
+        grep_stop = function()
+            if grep_cancel then
+                pcall(grep_cancel)
+                grep_cancel = nil
+            end
+        end
+        --- (Re)start ripgrep for `query`: free the old blob, open a fresh one, and stream rg into it. A grep
+        --- GENERATION guards the async feed/done/tick callbacks so a superseded run (a newer query, or close)
+        --- can never touch the freed blob.
+        ---@param query string
+        grep_start = function(query)
+            grep_stop()
+            if state.blob then
+                fuzzy.blob_free(state.blob) -- a new query = a new candidate set → reclaim the old pool eagerly
+            end
+            state.blob = fuzzy.blob_new()
+            state.src_cache = {} -- native index → derived `_src` (indices restart at 1 for the fresh blob)
+            state.pool_n, state.grep_total, state.grep_query = 0, 0, query
+            state.grep_done = false -- a fresh (re)grep is streaming → don't blank the list on an empty early pass
+            state.grep_gen = (state.grep_gen or 0) + 1
+            local mygen = state.grep_gen
+            local myblob = state.blob
+            if not myblob then
+                return -- blob_new failed (should not happen — opts.grep is only set when fuzzy.has_blob())
+            end
+            local counter = { total = 0 } -- rg's read callback tallies the TRUE match count in here (incl. overflow)
+            local pending = false
+            --- Push the growing pool + the live tally to the UI (a LIGHT refilter — count + rows only — while
+            --- streaming; a FULL final pass fetches the preview + fits the surface).
+            ---@param final boolean
+            local function tick(final)
+                if state.closed or mygen ~= state.grep_gen then
+                    return -- superseded (a newer grep / close) → don't touch the (freed) blob
+                end
+                state.pool_n = fuzzy.blob_count(myblob)
+                state.grep_total = counter.total
+                refilter(state.query, not final)
+            end
+            local function feed_bytes(data)
+                if state.closed or mygen ~= state.grep_gen or type(data) ~= "string" or #data == 0 then
+                    return
+                end
+                fuzzy.blob_append(myblob, data)
+                if not pending then
+                    pending = true
+                    vim.defer_fn(function()
+                        pending = false
+                        tick(false)
+                    end, (config or {}).stream_refresh_ms or 50)
+                end
+            end
+            local function done()
+                if state.closed or mygen ~= state.grep_gen then
+                    return
+                end
+                state.grep_done = true -- rg finished: an empty result is now REAL ("no matches"), so render it
+                fuzzy.blob_flush(myblob) -- a final line without a trailing newline becomes a candidate
+                tick(true)
+            end
+            local argv = source.grep_cmd(query, opts.grep.regex, opts.grep.file)
+            grep_cancel = source.spawn_grep_blob(argv, feed_bytes, done, (config or {}).grep_max or 500000, counter)
+        end
+        --- Ctrl-g: flip GREP mode ⇄ FILTER mode (like fzf-lua's `<ctrl-g>`) — LIVE grep only. GREP→FILTER
+        --- FREEZES rg at the current result set (the typed query then fuzzy-filters the loaded blob); FILTER→GREP
+        --- resumes the live search (a re-grep is forced for the current query).
+        grep_toggle = function()
+            if not opts.grep.live then
+                return -- a fixed-query grep is always in FILTER mode; there is no live search to toggle
+            end
+            --- Read / replace the query input line (so the mode swap can CLEAR it for a fresh filter and RESTORE
+            --- the grep query when returning). Placing the cursor at the end keeps typing natural.
+            local function input_text()
+                return (state.input_buf and api.nvim_buf_is_valid(state.input_buf))
+                        and (api.nvim_buf_get_lines(state.input_buf, 0, 1, false)[1] or "")
+                    or ""
+            end
+            local function set_input(text)
+                if state.input_buf and api.nvim_buf_is_valid(state.input_buf) then
+                    api.nvim_buf_set_lines(state.input_buf, 0, -1, false, { text })
+                    local w = vim.fn.bufwinid(state.input_buf)
+                    if w ~= -1 then
+                        pcall(api.nvim_win_set_cursor, w, { 1, #text })
+                    end
+                end
+            end
+            if state.grep_mode == "grep" then
+                state.grep_mode = "filter"
+                grep_stop() -- freeze: stop driving rg; keep the blob as-is
+                state.grep_saved_input = input_text() -- remember the grep query…
+                set_input("") -- …and CLEAR the input for a fresh fuzzy filter over the loaded results
+                state.query = ""
+            else
+                state.grep_mode = "grep"
+                state.grep_query = nil -- force a re-grep of the restored query on the next refilter
+                local restored = state.grep_saved_input or ""
+                set_input(restored) -- RESTORE the grep query
+                state.query = restored
+                state.grep_saved_input = nil
+            end
+            if state.update_mode then
+                state.update_mode() -- reflect the mode in the title indicator + the search-bar badge
+            end
+            refilter(state.query)
+        end
+        -- `grep_stop` is called from on_close too; expose it via state so the teardown reaches it.
+        state.grep_stop = grep_stop
+    end
+
+    -- Query-driven refilter is DEBOUNCED: at huge pool sizes one match is ~100–165 ms, and running it
+    -- synchronously on EVERY keystroke stacks up and freezes the UI while typing fast. Coalesce rapid
+    -- keystrokes so the match runs once the user pauses (`config.debounce_ms`; 0 = off, for small/instant
+    -- sets). `state.query` is recorded immediately so the prompt / gen stay in sync before the match runs.
+    -- A generation guard lets superseded defer_fn timers fire as cheap no-ops (auto-closed) — no leak.
+    local debounce_gen = 0
+    local function refilter_debounced(q)
+        state.query = q or ""
+        local ms = (config or {}).debounce_ms or 50
+        if ms <= 0 then
+            refilter(state.query)
+            return
+        end
+        debounce_gen = debounce_gen + 1
+        local mygen = debounce_gen
+        vim.defer_fn(function()
+            if mygen == debounce_gen and not state.closed then
+                refilter(state.query)
+            end
+        end, ms)
     end
     -- Activate filter button `id` in group `gi`: re-narrow + re-render, then re-sync the button specs' live
     -- `active` flags (so the header re-paints the NEW active button, not the build-time one) + counts.
@@ -1173,6 +1784,54 @@ build = function(opts, kind)
             opts.on_cancel()
         end
     end
+    -- MODE-AWARE footer legend. The move keys differ by focus — in the PROMPT (insert) `C-j`/`C-k` move the
+    -- selection (`j`/`k` would type); in the NORMAL list `j`/`k` move and the filter hotkeys (`Tab` mark,
+    -- `<C-q>` qf) activate directly. So the footer is rebuilt on every prompt⇄list switch via `set_footer`, and
+    -- shows the keys that ACTUALLY work in the current context. `<C-f>` flips the two (→ list from the prompt,
+    -- → typing from the list). Config-bound keys are labelled from their live `config.keys` value.
+    local function klabel(k)
+        if type(k) == "table" then
+            k = k[1]
+        end
+        return (tostring(k or ""):gsub("^<(.-)>$", "%1"))
+    end
+    ---@param ctx "prompt"|"list"
+    ---@return table[]  the footer item list for this focus context
+    build_footer = function(ctx)
+        local items
+        if ctx == "list" then
+            items = {
+                { key = "<CR>", name = "open" },
+                { key = "j/k", name = "move" },
+                { key = klabel(kcfg.mark), name = "mark" },
+                { key = klabel(kcfg.quickfix), name = "qf" },
+            }
+        else -- prompt (insert): C-j/k move the selection while you type
+            items = {
+                { key = "<CR>", name = "open" },
+                { key = "C-j/k", name = "move" },
+            }
+        end
+        if preview_provider then
+            items[#items + 1] = { key = "C-d/u", name = "preview" }
+        end
+        for _, a in ipairs(opts.keys or {}) do
+            if a.name then
+                items[#items + 1] = { key = a.key, name = a.name }
+            end
+        end
+        if opts.grep and opts.grep.live then
+            items[#items + 1] = { key = klabel(kcfg.grep_filter), name = "grep⇄filter" }
+        end
+        items[#items + 1] = { key = "C-f", name = ctx == "list" and "type" or "list" } -- flip prompt⇄list
+        items[#items + 1] = { key = "C-c", name = "close" }
+        return items
+    end
+    local function set_footer_ctx(ctx)
+        if state.st and state.st.set_footer then
+            state.st.set_footer({ bars = { { items = build_footer(ctx) } } })
+        end
+    end
     -- Telescope-style modes: the prompt is INSERT (fuzzy type); <Esc> drops to NORMAL on the list (j/k move,
     -- <C-l>/<C-h> panel nav, the filter bar) — `focus_input` returns to typing, `focus_list` leaves insert.
     focus_input = function()
@@ -1180,6 +1839,7 @@ build = function(opts, kind)
         if w ~= -1 then
             api.nvim_set_current_win(w)
             vim.cmd("startinsert!")
+            set_footer_ctx("prompt") -- typing again → the prompt-context key hints
         end
     end
     local function focus_list()
@@ -1187,6 +1847,7 @@ build = function(opts, kind)
         if state.st and state.st.focus_block then
             state.st.focus_block("list")
         end
+        set_footer_ctx("list") -- on the list → the normal-mode key hints (j/k move · Tab mark · C-q qf)
     end
     -- Run a consumer `opts.keys` action on the SELECTED item: it gets the item's source value, a `close`
     -- callback (dismiss the finder, or keep it open), and the MARKED source values (the multi-select, in mark
@@ -1240,6 +1901,56 @@ build = function(opts, kind)
                 },
             }
         or nil
+    -- Prompt badge (shared `config.prompt`): an icon and/or label on the STRONG tint, then a gap on the LIGHT
+    -- input tint before the typed text. Built HERE (before `update_mode`) so a live-grep <C-g> toggle can swap
+    -- it — FILTER mode uses `filter_icon`/`filter_label` so the SEARCH BAR itself signals the mode.
+    local prompt_hl = hl("prompt", "LvimUiPickerPrompt")
+    local input_hl = hl("input", "LvimUiPickerInput")
+    ---@param mode string?  "filter" swaps to the filter badge; anything else = the normal (grep/search) badge
+    ---@return table  the prompt chunk list: `{ badge, prompt_hl }` + `{ gap, input_hl }`
+    local function build_prompt(mode)
+        local pcfg = (config or {}).prompt or {}
+        local sp = string.rep
+        local filter = mode == "filter"
+        local icon = filter and (pcfg.filter_icon or pcfg.icon or "") or (pcfg.icon or "")
+        local label = filter and (pcfg.filter_label or pcfg.label or "") or (pcfg.label or "")
+        local has_icon = icon ~= ""
+        local has_label = label ~= ""
+        local badge = sp(" ", pcfg.pad_left or 1)
+        if has_icon then
+            badge = badge .. icon
+        end
+        if has_icon and has_label then
+            badge = badge .. sp(" ", pcfg.icon_gap or 1)
+        end
+        if has_label then
+            badge = badge .. label
+        end
+        badge = badge .. sp(" ", pcfg.pad_right or 1)
+        return { { badge, prompt_hl }, { sp(" ", pcfg.input_gap or 1), input_hl } }
+    end
+    -- (grep, live only) the Ctrl-g MODE indicator: the TITLE gains "➤ filter" AND the SEARCH BAR badge swaps to
+    -- the filter badge while rg is frozen (the query fuzzy-filters the loaded results). Applied live via
+    -- `set_title` + `set_prompt` (an IN-PLACE repaint — the query text, cursor and on_change are untouched).
+    if opts.grep and opts.grep.live then
+        state.update_mode = function()
+            if not (state.st and state.st.set_title) then
+                return
+            end
+            local suffix = (state.grep_mode == "filter") and " ➤ Filter" or ""
+            state.st.set_title({
+                icon = opts.icon,
+                text = (opts.title or "Grep") .. suffix,
+                style = {
+                    icon = { hl = hl("title_icon", "LvimUiPeekTitleIcon") },
+                    text = { hl = hl("title", "LvimUiPeekTitle") },
+                },
+            })
+            if state.st.set_prompt and not opts.prompt then -- swap the search-bar badge to match the mode
+                state.st.set_prompt(build_prompt(state.grep_mode), prompt_hl, input_hl)
+            end
+        end
+    end
     local list_block = {
         id = "list",
         provider = list_provider,
@@ -1280,50 +1991,12 @@ build = function(opts, kind)
     if not next(slot_override) then
         slot_override = nil
     end
-    -- Prompt badge (shared `config.prompt`): an icon and/or label on the STRONG tint, then a gap on
-    -- the LIGHT input tint before the typed text. Two virt_text chunks so the badge and the gap carry their
-    -- own backgrounds. A per-call `opts.prompt` STRING overrides it (a single badge-tint chunk).
-    local pcfg = (config or {}).prompt or {}
-    local prompt_hl = hl("prompt", "LvimUiPickerPrompt")
-    local input_hl = hl("input", "LvimUiPickerInput")
-    local prompt_text
-    if opts.prompt then
-        prompt_text = opts.prompt -- a literal override
-    else
-        local sp = string.rep
-        local has_icon = (pcfg.icon or "") ~= ""
-        local has_label = (pcfg.label or "") ~= ""
-        local badge = sp(" ", pcfg.pad_left or 1)
-        if has_icon then
-            badge = badge .. pcfg.icon
-        end
-        if has_icon and has_label then
-            badge = badge .. sp(" ", pcfg.icon_gap or 1) -- the gap between the icon and the label
-        end
-        if has_label then
-            badge = badge .. pcfg.label
-        end
-        badge = badge .. sp(" ", pcfg.pad_right or 1)
-        -- chunk list: badge (strong tint) + a gap on the input tint before the typed text
-        prompt_text = { { badge, prompt_hl }, { sp(" ", pcfg.input_gap or 1), input_hl } }
-    end
-
-    -- Footer hints: the standard actions + any consumer `opts.keys` that carry a `name`. `<Esc>` drops to
-    -- NORMAL on the list (j/k move, <C-l> preview, the filter bar); `i` returns to typing, `<C-c>` cancels.
-    local footer_items = {
-        { key = "<CR>", name = "open" },
-        { key = "C-j/k", name = "move" },
-    }
-    for _, a in ipairs(opts.keys or {}) do
-        if a.name then
-            footer_items[#footer_items + 1] = { key = a.key, name = a.name }
-        end
-    end
-    footer_items[#footer_items + 1] = { key = "Esc", name = "normal" }
-    if area then -- (HOSTED area) NORMAL-mode <C-j> descends into the messages composed below the finder
-        footer_items[#footer_items + 1] = { key = "C-j", name = "msgs" }
-    end
-    footer_items[#footer_items + 1] = { key = "C-c", name = "close" }
+    -- The prompt badge (built by `build_prompt` above, in the GREP/search variant): a per-call `opts.prompt`
+    -- STRING overrides it; a live-grep <C-g> toggle later swaps to the FILTER badge via `state.st.set_prompt`.
+    local prompt_text = opts.prompt or build_prompt("grep")
+    -- The footer legend is MODE-AWARE (`build_footer`, defined near `focus_input`): the finder opens in the
+    -- PROMPT, so it starts with the prompt-context hints; `focus_input`/`focus_list` swap it on every switch.
+    local footer_items = build_footer("prompt")
 
     -- The header FILTER bar, built through the SHARED filter-group model (lvim-ui.filters) — identical to
     -- the one ui.tabs uses. The picker only supplies the SEMANTICS: the live count (items passing the OTHER
@@ -1409,7 +2082,7 @@ build = function(opts, kind)
                     -- scope the prompt to the LIST panel (by id, so it tracks it through every preview rotation):
                     -- the input always sits just above the list, never over the preview.
                     scope_id = preview_provider and "list" or nil,
-                    on_change = refilter,
+                    on_change = refilter_debounced,
                     keys = function(buf, st)
                         state.st = st
                         state.input_buf = buf -- so NORMAL-mode list can jump back to typing (focus_input)
@@ -1442,6 +2115,20 @@ build = function(opts, kind)
                             confirm()
                         end)
                         imap("<C-c>", cancel) -- hard cancel from the prompt
+                        -- (grep) Ctrl-g: toggle GREP ⇄ FILTER mode (drive rg vs fuzzy-filter the loaded blob).
+                        if grep_toggle then
+                            for _, k in ipairs(keylist(kcfg.grep_filter)) do
+                                imap(k, grep_toggle)
+                            end
+                        end
+                        -- Swap the finder's backend (tint ⇄ fzf) while typing — command finders only.
+                        if opts.reopen then
+                            for _, k in ipairs(keylist(kcfg.swap_backend)) do
+                                imap(k, function()
+                                    swap_backend("tint", opts)
+                                end)
+                            end
+                        end
                         -- Telescope-style: <Esc> / <C-f> drop to NORMAL on the list (where the filter hotkeys
                         -- activate directly — typing in INSERT would feed them to the query). <C-f> in normal
                         -- toggles back to typing.
@@ -1487,8 +2174,20 @@ build = function(opts, kind)
                 pcall(state.stream_cancel)
                 state.stream_cancel = nil
             end
+            if state.count_cancel then -- kill the background grep file-count (fd) if still running
+                pcall(state.count_cancel)
+                state.count_cancel = nil
+            end
+            if state.grep_stop then -- kill an in-flight grep rg (the controller's live/fixed producer)
+                pcall(state.grep_stop)
+            end
             _texts_cache = nil -- drop the cached candidate texts (and the fuzzy prepared context) for this run
             fuzzy.release()
+            if state.blob then -- free the native blob-stream pool (a huge tree's SoA reclaimed eagerly)
+                fuzzy.blob_free(state.blob)
+                state.blob = nil
+                state.src_cache = nil
+            end
             if state.input_buf then -- drop the custom blue caret registration (cursor module restores normal)
                 pcall(require("lvim-utils.cursor").mark_cursor_buffer, state.input_buf, nil)
             end
@@ -1576,32 +2275,122 @@ build = function(opts, kind)
         })
     end
 
+    -- (grep) BACKGROUND FILE COUNT: grep's counter is `matches / total files in the tree`, so — alongside rg —
+    -- stream the SAME file list the `files` finder uses (`file_list_cmd`) purely to COUNT it (the bytes are
+    -- discarded, only newlines are tallied; paced + 0%-blocked exactly like the files load). The count climbs to
+    -- the tree's file total, which `count_fn` uses as the counter's denominator. Killed in on_close.
+    if opts.count_files then
+        state.file_total = 0
+        local pending_c = false
+        state.count_cancel = spawn_stream_raw(file_list_cmd(), function(data)
+            local _, n = data:gsub("\n", "\n")
+            state.file_total = state.file_total + n
+            if not pending_c then -- coalesce the counter refresh (the number climbs smoothly, not per chunk)
+                pending_c = true
+                vim.defer_fn(function()
+                    pending_c = false
+                    if not state.closed then
+                        refresh_count()
+                    end
+                end, (config or {}).stream_refresh_ms or 50)
+            end
+        end, function()
+            if not state.closed then
+                refresh_count()
+            end
+        end)
+    end
+
+    -- GREP CONTROLLER (Variant B): kick off the search. A LIVE grep waits for the user to type (>= min_chars) —
+    -- refilter's on_change drives the first rg. A FIXED-query grep (cword / cWORD / selection / prompt / curbuf)
+    -- runs rg ONCE now, into the blob, and starts in FILTER mode so the typed query fuzzy-narrows the results.
+    -- Requires ABI ≥ 5 (M.grep only sets opts.grep on the blob path); the fallback uses opts.source / opts.stream.
+    if opts.grep then
+        state.grep_mode = opts.grep.live and "grep" or "filter"
+        if not opts.grep.live then
+            grep_start(opts.grep.query or "")
+        end
+        return
+    end
+
+    -- ASYNC BLOB STREAM (GAP-5): `opts.blob_stream(feed_bytes, done)` produces the listing incrementally, and
+    -- `feed_bytes(raw)` hands the producer's RAW stdout bytes STRAIGHT to the native matcher (which splits on
+    -- `\n` and stores each line as a candidate) — ZERO Lua per-row string/table work, so a ~2M-file tree loads
+    -- without building (and interning + GC-ing) a multi-million-string Lua pool. The candidate pool IS the
+    -- native context; `refilter` ranks it and materialises only the top-K rows. `opts.blob_item(text)` derives
+    -- an item's `_src` from its path (files/dirs/git: `{ path = text }`). The producer is killed + the context
+    -- freed in on_close. Requires ABI ≥ 5 (`fuzzy.has_blob()`); a finder falls back to `opts.stream` otherwise.
+    -- Mutually exclusive with the per-query live `source` and the per-string `stream`.
+    if opts.blob_stream and not opts.source then
+        state.blob = fuzzy.blob_new()
+    end
+    if state.blob then
+        state.src_cache = {} -- native index → derived `_src` item (stable identity for marks; see blob_rows)
+        state.pool_n = 0
+        local pending = false
+        --- Ingest one raw stdout chunk into the native pool (no Lua per-row work), then schedule ONE coalesced
+        --- light refilter so the count + visible rows track the growing pool.
+        ---@param data string
+        local function feed_bytes(data)
+            if state.closed or type(data) ~= "string" or #data == 0 then
+                return
+            end
+            state.pool_n = fuzzy.blob_append(state.blob, data)
+            if not pending then
+                pending = true
+                vim.defer_fn(function()
+                    pending = false
+                    if not state.closed then
+                        refilter(state.query, true) -- LIGHT: count + rows only (see rerender)
+                    end
+                end, (config or {}).stream_refresh_ms or 200)
+            end
+        end
+        local function done()
+            if state.closed then
+                return
+            end
+            fuzzy.blob_flush(state.blob) -- a final line without a trailing newline becomes a candidate
+            state.pool_n = fuzzy.blob_count(state.blob)
+            refilter(state.query) -- FULL final pass: fetch the preview + fit the surface to the result
+        end
+        state.stream_cancel = opts.blob_stream(feed_bytes, done)
+        return
+    end
+
     -- ASYNC STREAM source: `opts.stream(feed, done)` produces candidates incrementally (a spawned `fd` / `rg`
     -- streamed in via `spawn_stream`), so the open NEVER blocks on a huge tree. `feed(raw)` appends the batch
     -- to the candidate pool and schedules ONE coalesced refilter (fuzzy is already async); `done()` does a
-    -- final pass. The producer is killed in on_close. Mutually exclusive with the per-query live `source`.
+    -- final pass. The producer is killed in on_close. Mutually exclusive with the per-query live `source`. This
+    -- is the FALLBACK path (an older .so without blob ingestion) — the blob path above supersedes it when ABI≥5.
     if opts.stream and not opts.source then
         local pending = false
         local function feed(raw)
             if state.closed or type(raw) ~= "table" or #raw == 0 then
                 return
             end
+            local n = #items -- one length probe per batch, not one per row (this loop runs ~2M times on ~/)
             for _, it in ipairs(normalize(raw, opts.format)) do
-                items[#items + 1] = it
+                n = n + 1
+                items[n] = it
             end
             if not pending then
                 pending = true
+                -- Coalesce a burst of stream chunks into one re-render. Long enough (config.stream_refresh_ms)
+                -- that the async query match SETTLES between refreshes instead of being superseded every time
+                -- (which would show nothing until the stream ended), and it thins the per-refresh ensure_ctx
+                -- append while files pour in.
                 vim.defer_fn(function()
                     pending = false
                     if not state.closed then
-                        refilter(state.query)
+                        refilter(state.query, true) -- LIGHT: count + rows only, no preview / relayout (see rerender)
                     end
-                end, 60) -- coalesce a burst of chunks into one re-render
+                end, (config or {}).stream_refresh_ms or 200)
             end
         end
         local function done()
             if not state.closed then
-                refilter(state.query)
+                refilter(state.query) -- FULL final pass: now fetch the preview + fit the surface to the result
             end
         end
         state.stream_cancel = opts.stream(feed, done)
@@ -1746,6 +2535,7 @@ end
 function M.buffers(opts)
     opts = opts or {}
     opts.key = opts.key or "buffers"
+    with_backend_swap(opts) -- enable the C-] backend swap (tint ⇄ fzf) for this finder
     local items = {}
     for _, b in ipairs(api.nvim_list_bufs()) do
         if vim.bo[b].buflisted then
@@ -1771,7 +2561,7 @@ function M.buffers(opts)
         end
         return { "[no preview]" }, ""
     end
-    local fb = fzf_backend()
+    local fb = fzf_backend(opts)
     if fb then
         -- Encode each entry as `bufnr\tname`; fzf shows/matches only field 2 (the name) via
         -- `--delimiter`/`--with-nth`, but hands back the whole line so we recover the bufnr.
@@ -1842,12 +2632,78 @@ end
 -- streamer (spawn_stream) are aliased from picker.source at the top of the file, so this tint backend and
 -- the fzf-TUI backend share one source layer.
 
+--- Configure `spec` (a tint finder whose candidates ARE their paths — files / directories / git_files) to
+--- STREAM `list_cmd` into the pool. GAP-5: when the native matcher supports blob ingestion (ABI ≥ 5) the raw
+--- stdout bytes go straight to the native context (`blob_stream` + `blob_item` — no Lua per-row work, so a
+--- multi-million-file tree never builds a Lua string pool); otherwise it falls back to the per-string line
+--- stream (`stream`). `text == path` for these finders, so `_src` is `{ path = text }` either way.
+---@param spec table  the finder spec passed to M.open (mutated in place)
+---@param list_cmd string[]  the listing command (argv)
+local function stream_paths(spec, list_cmd)
+    if fuzzy.has_blob() then
+        spec.blob_stream = function(feed_bytes, done)
+            return spawn_stream_raw(list_cmd, feed_bytes, done)
+        end
+        spec.blob_item = function(text)
+            return { path = text }
+        end
+    else
+        spec.stream = function(feed, done)
+            return spawn_stream(list_cmd, function(lines)
+                local batch = {}
+                for _, p in ipairs(lines) do
+                    if p ~= "" then
+                        batch[#batch + 1] = { text = p, path = p }
+                    end
+                end
+                feed(batch)
+            end, done)
+        end
+    end
+end
+
+--- Parse one ripgrep `--vimgrep` line (`path:lnum:col:text`) into a location item. Shared by the grep blob
+--- path (as `blob_item`, deriving `_src` from the candidate text on demand) and the fallback item stream.
+--- Returns nil for a line that is not a location (so the caller can decide the fallback).
+---@param line string
+---@return { path: string, lnum: integer, col: integer, text: string }?
+local function grep_item(line)
+    local file, lnum, col, text = line:match("^(.-):(%d+):(%d+):(.*)$")
+    if file then
+        return { path = file, lnum = tonumber(lnum), col = tonumber(col), text = text or "" }
+    end
+end
+
+--- A BOUNDED line streamer for a grep argv, building location ITEMS (the fallback when the native library
+--- predates the blob API, ABI < 5). Same `config.grep_max` cap (enforced in the read callback) + async
+--- streaming as the blob path — never floods the queue, never blocks. Returns a producer for `opts.stream`.
+---@param argv string[]
+---@return fun(feed: fun(raw: table[]), done: fun()): fun()
+local function grep_item_stream(argv)
+    return function(feed, done)
+        return spawn_stream(argv, function(lines)
+            local batch = {}
+            for _, ln in ipairs(lines) do
+                local it = grep_item(ln)
+                if it then
+                    it.text = ("%s:%s  %s"):format(it.path, it.lnum, it.text) -- display; _src keeps path/lnum/col
+                    batch[#batch + 1] = it
+                end
+            end
+            if #batch > 0 then
+                feed(batch)
+            end
+        end, done, (config or {}).grep_max or 500000)
+    end
+end
+
 --- Fuzzy file finder under cwd; confirming edits the file, with a content preview. `opts` forwarded to open.
 ---@param opts? table
 function M.files(opts)
     opts = opts or {}
     opts.key = opts.key or "files" -- dock kind key (tint/managed path); the fzf backend ignores it
-    local b = fzf_backend()
+    with_backend_swap(opts) -- enable the C-] backend swap (tint ⇄ fzf) for this finder
+    local b = fzf_backend(opts)
     if b then
         -- fzf runs `file_list_cmd()` as its producer (FZF_DEFAULT_COMMAND) and owns the list; we keep the
         -- real-Neovim preview + the open action.
@@ -1872,30 +2728,20 @@ function M.files(opts)
         )
         return
     end
-    M.open(vim.tbl_extend("force", {
+    local spec = {
         title = "Files",
-        -- Stream `fd`/`find` async so opening in a huge tree (e.g. `~/`) does not freeze the editor; results
-        -- fill in as they arrive and fuzzy-match live.
-        stream = function(feed, done)
-            return spawn_stream(file_list_cmd(), function(lines)
-                local batch = {}
-                for _, p in ipairs(lines) do
-                    if p ~= "" then
-                        batch[#batch + 1] = { text = p, path = p }
-                    end
-                end
-                feed(batch)
-            end, done)
-        end,
         on_confirm = function(it)
             if it and it.path then
                 vim.cmd.edit(vim.fn.fnameescape(it.path))
             end
         end,
-        preview = function(it)
-            return read_preview(it.path)
+        -- ASYNC file preview (read off the main thread, LRU-cached) so it follows the cursor while scrolling.
+        preview_file_of = function(s)
+            return s.path and s.path ~= "" and { path = s.path } or nil
         end,
-    }, opts or {}))
+    }
+    stream_paths(spec, file_list_cmd())
+    M.open(vim.tbl_extend("force", spec, opts or {}))
 end
 
 --- Fuzzy directory finder under cwd; confirming `:cd`s into the chosen directory. `opts` forwarded to open.
@@ -1903,7 +2749,8 @@ end
 function M.directories(opts)
     opts = opts or {}
     opts.key = opts.key or "directories"
-    local b = fzf_backend()
+    with_backend_swap(opts) -- enable the C-] backend swap (tint ⇄ fzf) for this finder
+    local b = fzf_backend(opts)
     if b then
         open_fzf(
             b,
@@ -1926,19 +2773,8 @@ function M.directories(opts)
         )
         return
     end
-    M.open(vim.tbl_extend("force", {
+    local spec = {
         title = "Directories",
-        stream = function(feed, done) -- async, so a huge tree never freezes the open
-            return spawn_stream(dir_list_cmd(), function(lines)
-                local batch = {}
-                for _, p in ipairs(lines) do
-                    if p ~= "" then
-                        batch[#batch + 1] = { text = p, path = p }
-                    end
-                end
-                feed(batch)
-            end, done)
-        end,
         on_confirm = function(it)
             if it and it.path then
                 vim.cmd.cd(vim.fn.fnameescape(it.path))
@@ -1947,7 +2783,9 @@ function M.directories(opts)
         preview = function(it)
             return run_lines({ "ls", "-A", it.path }), ""
         end,
-    }, opts or {}))
+    }
+    stream_paths(spec, dir_list_cmd())
+    M.open(vim.tbl_extend("force", spec, opts or {}))
 end
 
 --- LIVE grep (ripgrep) under cwd: each query re-runs `rg`, the matches ARE the results, with a preview that
@@ -1956,6 +2794,7 @@ end
 function M.grep(opts)
     opts = opts or {}
     opts.key = opts.key or "grep" -- a fixed-query variant (cword / …) sets its own key BEFORE calling here
+    with_backend_swap(opts) -- enable the C-] backend swap (tint ⇄ fzf) for this finder
     if not has("rg") then
         vim.notify("lvim-picker.grep needs ripgrep (rg)", vim.log.levels.WARN)
         return
@@ -1975,7 +2814,7 @@ function M.grep(opts)
         end
         return { path = line, text = line }
     end
-    local b = fzf_backend()
+    local b = fzf_backend(opts)
     if b then
         -- fzf live mode: each keystroke RELOADS ripgrep with the query — fzf re-renders the matches
         -- continuously. fzf does no fuzzy ranking of its own (`--disabled`); rg IS the search.
@@ -2005,25 +2844,13 @@ function M.grep(opts)
         open_fzf(b, vim.tbl_extend("force", backend, opts))
         return
     end
-    --- Parse one ripgrep `--vimgrep` stdout line into a location item (`path:lnum:col:text`).
-    ---@param line string
-    ---@return table?
-    local function rg_item(line)
-        local file, lnum, col, text = line:match("^(.-):(%d+):(%d+):(.*)$")
-        if file then
-            return {
-                text = ("%s:%s  %s"):format(file, lnum, text),
-                path = file,
-                lnum = tonumber(lnum),
-                col = tonumber(col),
-            }
-        end
-    end
+    local fixed = opts.query ~= nil and opts.query ~= "" -- a fixed-query grep (cword / cWORD / selection / …)
     local tint = {
         title = "Grep",
-        preview = function(it)
-            local lines, ft = read_preview(it.path, preview_span(it.lnum))
-            return lines, ft, it.lnum -- focus the preview on the matched line
+        -- ASYNC file preview, focused on the matched line — read off the main thread + LRU-cached, so scrolling
+        -- grep results (every row a different file:line) follows the cursor instead of a per-move disk read.
+        preview_file_of = function(s)
+            return s.path and s.path ~= "" and { path = s.path, lnum = s.lnum } or nil
         end,
         on_confirm = function(it)
             if it and it.path then
@@ -2033,47 +2860,83 @@ function M.grep(opts)
             end
         end,
     }
-    if opts.query and opts.query ~= "" then
-        -- FIXED-query grep (cword / cWORD / selection / prompt): rg runs ONCE, then the matches are
-        -- fuzzy-filtered as static items — mirroring the fzf static branch. The live `source` below only reacts
-        -- to the TYPED query, so without this a word-under-cursor grep would open with an EMPTY list.
-        local static = {}
-        for _, line in ipairs(run_lines(source.grep_cmd(opts.query, opts.regex))) do
-            static[#static + 1] = rg_item(line)
+    if fuzzy.has_blob() then
+        -- VARIANT B — the GREP CONTROLLER holds EVERY rg match in the native blob (like fzf keeps them in its
+        -- own process), so there is NO browse cap and the counter climbs to the REAL total (e.g. 403127) as rg
+        -- streams. LIVE grep (no fixed query): the typed query drives rg, re-grepping into a fresh blob per
+        -- change; Ctrl-g freezes rg and fuzzy-filters the loaded results. FIXED-query grep: rg runs ONCE, then
+        -- the typed query fuzzy-narrows the blob. `config.grep_max` is the native STORE ceiling (a broader query
+        -- is still fully counted, never stored — no OOM). `blob_item` re-derives path/lnum/col from each line.
+        tint.grep = {
+            live = not fixed,
+            query = opts.query,
+            regex = opts.regex,
+            file = opts.file,
+        }
+        tint.blob_item = function(text)
+            return grep_item(text) or { path = text, text = text }
         end
-        tint.items = static
     else
-        -- LIVE grep: each query re-runs `rg`. Keep the in-flight handle so a fast typist does not pile up a
-        -- stack of whole-tree scans — the previous rg is killed before the next spawns (and on close).
-        local grep_handle
-        local function kill_grep()
-            if grep_handle then
-                pcall(function()
-                    grep_handle:kill("sigterm")
-                end)
-                grep_handle = nil
+        -- FALLBACK (native library predates ABI 5 / the Lua matcher): the bounded source/stream path with the
+        -- `matches / total-files` counter. rg's stdout is capped at `config.grep_max` in the read callback (rg
+        -- killed at the cap) so a broad query never floods the queue. No Ctrl-g / uncapped browse on this path.
+        tint.count_files = true -- counter = `matches found / TOTAL FILES in the tree` (background fd count)
+        if fixed then
+            -- rg runs ONCE for the fixed query; its bounded item stream feeds the matcher, then you fuzzy-filter.
+            tint.stream = grep_item_stream(source.grep_cmd(opts.query, opts.regex, opts.file))
+        else
+            -- LIVE grep: each typed query re-runs `rg` (rg IS the search). rg's stdout is STREAMED in chunks and
+            -- capped at `config.grep_max`; the previous rg is killed before the next spawns (and on close).
+            local grep_cancel ---@type fun()?
+            local function kill_grep()
+                if grep_cancel then
+                    pcall(grep_cancel) -- kills rg + drops any queued backlog (spawn_stream cancel)
+                    grep_cancel = nil
+                end
             end
-        end
-        tint.source = function(query, cb)
-            kill_grep()
-            if query == nil or #query < 2 then -- wait for a couple of chars (rg over a huge tree is heavy)
-                cb({})
-                return
+            --- One raw vimgrep line → a GRID item, or nil for a non-location line. Built directly (not via
+            --- `normalize`) so the progressive live stream can APPEND to one growing list — `source_raw` tells
+            --- the finder to skip re-normalising it per batch.
+            ---@param line string
+            ---@return table?
+            local function live_item(line)
+                local it = grep_item(line)
+                if it then
+                    return { text = ("%s:%s  %s"):format(it.path, it.lnum, it.text), _src = it }
+                end
             end
-            -- ripgrep argv from the shared source layer: matches the query LITERALLY unless `opts.regex`, and
-            -- shares the file-source config so CONTENT search matches what `files` LISTS (hidden / .gitignore /
-            -- the excluded dirs).
-            grep_handle = vim.system(source.grep_cmd(query, opts.regex), { text = true }, function(res)
-                vim.schedule(function()
-                    local out = {}
-                    for line in (res.stdout or ""):gmatch("[^\n]+") do
-                        out[#out + 1] = rg_item(line)
+            tint.source_raw = true -- `out` already holds grid items; skip re-normalising per delivery
+            tint.source = function(query, cb)
+                kill_grep() -- cancel the previous query's rg before starting a new one (no pile-up)
+                if query == nil or #query < 2 then -- wait for a couple of chars (rg over a huge tree is heavy)
+                    cb({})
+                    return
+                end
+                local out, pending = {}, false
+                local function deliver() -- coalesce a burst of drains into one re-render; keep the count live
+                    if pending then
+                        return
                     end
+                    pending = true
+                    vim.defer_fn(function()
+                        pending = false
+                        cb(out)
+                    end, (config or {}).stream_refresh_ms or 50)
+                end
+                grep_cancel = spawn_stream(source.grep_cmd(query, opts.regex, opts.file), function(lines)
+                    for _, ln in ipairs(lines) do
+                        local it = live_item(ln)
+                        if it then
+                            out[#out + 1] = it
+                        end
+                    end
+                    deliver()
+                end, function() -- rg exited: one FINAL delivery with the complete (bounded) match set
                     cb(out)
-                end)
-            end)
+                end, (config or {}).grep_max or 500000) -- cap enforced in the read callback (no queue flood)
+            end
+            tint.on_close = kill_grep -- kill any in-flight rg when the finder closes
         end
-        tint.on_close = kill_grep -- kill any in-flight rg when the finder closes
     end
     M.open(vim.tbl_extend("force", tint, opts))
 end
@@ -2200,12 +3063,13 @@ end
 function M.git_files(opts)
     opts = opts or {}
     opts.key = opts.key or "git_files"
+    with_backend_swap(opts) -- enable the C-] backend swap (tint ⇄ fzf) for this finder
     local inside = run_lines({ "git", "rev-parse", "--is-inside-work-tree" })[1]
     if inside ~= "true" then
         vim.notify("lvim-picker.git_files: not inside a git work tree", vim.log.levels.WARN)
         return
     end
-    local b = fzf_backend()
+    local b = fzf_backend(opts)
     if b then
         open_fzf(
             b,
@@ -2228,19 +3092,8 @@ function M.git_files(opts)
         )
         return
     end
-    M.open(vim.tbl_extend("force", {
+    local spec = {
         title = "Git files",
-        stream = function(feed, done) -- stream `git ls-files` async (the rev-parse guard above is a quick check)
-            return spawn_stream({ "git", "ls-files" }, function(lines)
-                local batch = {}
-                for _, p in ipairs(lines) do
-                    if p ~= "" then
-                        batch[#batch + 1] = { text = p, path = p }
-                    end
-                end
-                feed(batch)
-            end, done)
-        end,
         on_confirm = function(it)
             if it and it.path then
                 vim.cmd.edit(vim.fn.fnameescape(it.path))
@@ -2249,7 +3102,9 @@ function M.git_files(opts)
         preview = function(it)
             return read_preview(it.path)
         end,
-    }, opts or {}))
+    }
+    stream_paths(spec, { "git", "ls-files" }) -- the rev-parse guard above is a quick check
+    M.open(vim.tbl_extend("force", spec, opts or {}))
 end
 
 --- Fuzzy finder over installed COLORSCHEMES; confirming applies it (`:colorscheme`). Restores the current

@@ -133,4 +133,89 @@ See
 |lvim-picker-dock_stack| for docking and |lvim-picker-per-call| for the
 per-call `opts.dock_stack` / `opts.force` passthrough.
 
+                                                          *lvim-picker-streaming*
+The streamed tint finders (files / directories / git_files) ingest their
+listing PACED: the producer's stdout is queued and drained in bounded
+main-thread slices of `stream_slice_ms` (default 4 ms) with a yield to the
+event loop between slices, while the growing pool re-renders (rows + live
+counter) every `stream_refresh_ms` (default 50 ms). A multi-million-file tree
+therefore streams in smoothly — typing, moving and redraw stay responsive
+throughout the load.
+
+When the lvim-fuzzy native library supports blob ingestion (ABI >= 5, the
+default build), those finders take it further: the producer's raw stdout bytes
+go STRAIGHT to the native matcher (which splits on newlines itself), so the
+candidate pool never becomes a pool of Lua strings/tables — only the visible and
+top-K result rows are ever materialised (their text pulled from the native
+context by index). This removes the LuaJIT string-intern + GC pauses of a
+multi-million-candidate pool: the main thread stays essentially unblocked for the
+whole load. An older library (ABI < 5) transparently falls back to the
+per-string streaming path. Selection, `<CR>` open, preview, multi-select marks
+and the result sort all work identically on either path.
+
+                                                                *lvim-picker-grep*
+The Lua tint grep HOLDS EVERY ripgrep match in the native matcher (like fzf keeps
+them in its own process), so there is NO browse cap and the counter climbs to the
+REAL total as rg streams (e.g. `403127/403127`, never an under-reported 10000). It
+has two modes, toggled with `<C-g>` (config `keys.grep_filter`) like fzf's Regex ⇄
+fuzzy switch:
+
+  • GREP mode (the default for the live `grep`) — the typed query DRIVES ripgrep:
+    each keystroke re-runs rg, matches stream in PROGRESSIVELY (they appear the
+    instant they arrive and the count climbs, like fzf), and the counter is the
+    true rg match total (`N/N`, since rg IS the search — nothing filters on top).
+    The title reads "Grep".
+  • FILTER mode (`<C-g>`) — ripgrep is FROZEN at the current result set and the
+    typed query now FUZZY-FILTERS the loaded matches (no re-grep). The counter
+    becomes `matched/loaded`, the matched number SHRINKING as you narrow. The title
+    reads "Grep ➤ filter".
+
+The fixed-query greps (grep_cword / grep_cWORD / grep_visual / grep_word /
+grep_curbuf) grep ONCE for their word and open straight in FILTER mode, so you
+fuzzy-narrow their matches as you type. `grep_curbuf` restricts rg to the current
+buffer's file.
+
+Memory stays bounded and the main thread ~0%-blocked at ANY scale: `grep_max`
+(default 500000) is the native STORE ceiling — up to this many matches are stored
+and browsable; a broader query is still fully COUNTED (the count keeps climbing to
+the truth) but its overflow bytes are DISCARDED in the read callback, never
+buffered → no `E41: out of memory`. `grep_max_columns` (default 512) caps each
+result line's length (rg's `--max-columns` + `--max-columns-preview`) so a minified
+/ cache / log file's megabyte-long line can't blow the blob up. Confirm always
+opens the focused row at its line:col. (An ABI < 5 native library / the Lua matcher
+falls back to a bounded stream that KILLS rg at `grep_max` — the pre-Variant-B
+behaviour, `matches / total-files` counter, no `<C-g>`.) The fzf-TUI grep backend
+is unchanged — fzf owns its own result set and its native `<ctrl-g>`.
+
+                                                             *lvim-picker-preview*
+The FILE previews (files / grep) are read ASYNCHRONOUSLY — off the main thread via
+libuv, bounded to `preview_max_lines`, and LRU-cached (`preview_cache`) — so the
+preview FOLLOWS the cursor while you hold `j` (a re-visited or same-file row is
+instant; a new file lands within a read) instead of freezing on a synchronous disk
+read per step. A single read is in flight at a time, always re-targeting the latest
+selection. The small in-memory previews (lsp / diagnostics / the editable file
+preview) update on a settle debounce (`preview_debounce_ms`) instead. The file
+preview panel holds a FIXED height (like fzf) so scrolling across files never
+reflows the windows.
+
+                                                             *lvim-picker-counter*
+The result counter shows the REAL numbers (never the ≤`max_results` shown-row
+count). The two numbers only ever differ when a query is actually narrowing a
+pool, so:
+  • with NO query typed → a SINGLE number, the pool count (with nothing filtering,
+    "found == total" is meaningless, so it shows just the count);
+  • with a query → `matched / total`, where MATCHED is the matcher's TRUE hit
+    count (it SHRINKS as you narrow) and TOTAL is the fixed pool;
+  • GREP mode → `N/N`: rg IS the search and nothing filters on top, so matched ==
+    total == the REAL rg match count (it CLIMBS to e.g. 403127 as rg streams).
+  • GREP FILTER mode (`<C-g>`) → `matched/loaded`: the fuzzy filter over the frozen
+    result set, the matched number SHRINKING as you narrow.
+The count updates live as results stream in.
+
+                                                              *lvim-picker-scroll*
+While results stream in (a files load, a progressive grep), your scroll POSITION
+is preserved: a same-query refresh keeps the selection + viewport (clamped to the
+grown list) rather than yanking back to the top, so you can browse while the count
+climbs. Only a QUERY CHANGE (a new search) resets to the top (the best match).
+
 vim:tw=78:ts=8:ft=help:norl:

@@ -60,6 +60,29 @@ pick.commands()
 pick.colorschemes()
 ```
 
+## Grep
+
+The Lua **tint grep** (`fzf_tui = false`, and every plugin using it) holds **all** ripgrep matches in the
+native matcher — like fzf keeps them in its own process — so there is **no browse cap** and the counter
+climbs to the **real total** as rg streams (e.g. `403127/403127`, never an under-reported `10000`). It has
+two modes, toggled with `<C-g>` (config `keys.grep_filter`) exactly like fzf's `Regex ⇄ fuzzy` switch:
+
+- **Grep mode** (default for `grep()` live grep) — the typed query **drives ripgrep**: each keystroke re-runs
+  rg, matches stream in progressively, and the counter is the true rg match total (`N/N`, since rg *is* the
+  search and nothing filters on top). The title reads `Grep`.
+- **Filter mode** (`<C-g>`) — ripgrep is **frozen** at the current result set and the typed query now
+  **fuzzy-filters** the loaded matches (no re-grep). The counter becomes `matched/loaded` and the matched
+  number **shrinks** as you narrow. The title reads `Grep ➤ filter`.
+
+The fixed-query greps (`grep_cword` / `grep_cWORD` / `grep_visual` / `grep_word` / `grep_curbuf`) grep **once**
+for their word and open straight in filter mode, so you fuzzy-narrow their matches as you type.
+
+Memory stays bounded and the main thread ~0%-blocked at any scale: `grep_max` is the native STORE ceiling (a
+broader query is still fully *counted*, its overflow bytes discarded — never buffered, no `E41: out of
+memory`), and `grep_max_columns` caps each result line so a minified / cache / log file's megabyte-long line
+can't blow the blob up. `<CR>` opens the focused match at its exact `line:col`. (The fzf-TUI grep backend,
+`fzf_tui = true`, is unchanged — fzf owns its own result set and its native `<ctrl-g>` toggle.)
+
 ## Dock stack
 
 When **lvim-utils** provides the shared dock-stack manager, every opened finder KIND is an entry in the
@@ -123,6 +146,8 @@ engine's config); it is optional (the defaults below work as-is). The full defau
 require("lvim-picker").setup({
     -- Default layout for every finder: "area" (message zone) | "float" (centred) | "bottom" (dock).
     layout = "area",
+    -- The tint-list finder's max visible rows (a secondary cap under the dock geometry height).
+    max_rows = 15,
     -- This plugin's OWN docking defaults, namespaced under `dock` (per-call opts.dock_stack / opts.force
     -- still override these for a single open).
     dock = {
@@ -139,11 +164,39 @@ require("lvim-picker").setup({
     },
     -- Real fzf TUI for the heavy command-driven finders (false = the Lua tint list). Needs fzf + mkfifo.
     fzf_tui = true,
+    -- (tint list) debounce of the query match, in ms (0 = a fresh non-blocking match on every keystroke).
+    debounce_ms = 0,
+    -- (streamed finders) how often, in ms, the growing pool re-renders (live counter + rows) while streaming.
+    stream_refresh_ms = 50,
+    -- (streamed finders) main-thread time budget, in ms, of one paced stream-ingest slice; the queued listing
+    -- drains in slices of this size with a yield to the event loop in between, so a huge tree loads smoothly.
+    stream_slice_ms = 4,
+    -- (tint list) how many candidates to marshal into the native matcher per background slice.
+    marshal_cap = 32768,
+    -- (tint grep — live AND fixed-query) the NATIVE-BLOB STORE CEILING: the tint grep holds EVERY rg match in
+    -- the native matcher (Variant B — like fzf keeps them in its own process), so there is NO browse cap and the
+    -- counter climbs to the REAL total. Up to this many matches are STORED + browsable; a broader query is still
+    -- fully COUNTED (the count keeps climbing) but the overflow bytes are DISCARDED in the read callback — never
+    -- buffered → no OOM, ~0% main-thread block. A HIGH pathological-query safety ceiling, not a normal limit.
+    grep_max = 500000,
+    -- (tint grep) cap on each ripgrep result line's length (rg's `--max-columns` + `--max-columns-preview`, so
+    -- an over-long line is truncated, not omitted). A broad search hits minified / cache / log files whose one
+    -- line is MEGABYTES; without this even a few hundred k matches buffer gigabytes into the blob. 0 disables.
+    grep_max_columns = 512,
+    -- (tint SYNC previews: lsp / diagnostics / editable) settle time, in ms, before the preview updates while
+    -- scrolling. FILE previews (files / grep) are read ASYNC (off the main thread, LRU-cached) and follow the
+    -- cursor on every move, so they ignore this. 0 = update every move.
+    preview_debounce_ms = 60,
+    -- (tint FILE previews) recently previewed files kept in the async LRU cache (instant re-visits).
+    preview_cache = 32,
+    -- (tint FILE previews) hard cap on lines materialised per preview (bounds a deep match in a huge file).
+    preview_max_lines = 2000,
     -- All finder keys (a value is a single key or a list; "" / {} disables it).
     keys = {
         accept = "<CR>", -- open / confirm the focused item
         mark = "<Tab>", -- toggle the focused row's mark (multi-select)
         quickfix = "<C-q>", -- send marked (or focused) rows to the quickfix list, then close
+        grep_filter = "<C-g>", -- (live tint grep) toggle GREP ⇄ FILTER mode: drive rg vs fuzzy-filter the loaded set
         preview_down = "<C-d>", -- scroll the preview down
         preview_up = "<C-u>", -- scroll the preview up
         park = "<C-o>", -- focus the editor without closing the finder; the same key returns
@@ -158,6 +211,15 @@ require("lvim-picker").setup({
     },
     -- Mark indicator drawn before a marked row (multi-select).
     marker = "➤",
+    -- Show file/directory icons in the finder lists (both backends); false = plain text rows.
+    show_icons = true,
+    -- Which icon plugin supplies file glyphs: "auto" (lvim-icons → nvim-web-devicons → mini.icons) or one of
+    -- "lvim" | "devicons" | "mini".
+    icon_provider = "auto",
+    -- lvim-icons colour mode for file icons ("theme" | "brand" | "theme_brand"); nil = the lvim-icons default.
+    icon_color_mode = nil,
+    -- Shared glyphs used by the source helpers.
+    icons = { directory = "󰉋" },
     -- Glyph dividing footer button groups.
     footer_separator = "●",
     -- Footer button list per mode (insert while typing · normal after <Esc>); groups of action ids.
@@ -217,8 +279,6 @@ require("lvim-picker").setup({
     },
     -- Preview winbar (the file title bar on the preview panel).
     preview = { show_icon = true, dir_pad_left = 1, dir_pad_right = 1 },
-    -- Area height per preview-stack direction (≤ 1 = fraction of the screen, > 1 = absolute rows).
-    preview_heights = { horizontal = 0.33, vertical = 0.66 },
     -- Shown when there are no results (list body + preview winbar).
     empty_text = "[no matches]",
     -- The preview placeholder when nothing is focused.

@@ -15,9 +15,15 @@
 ---@field fzf_tui         boolean  Use the real fzf TUI for heavy command-driven finders (false = the Lua tint list)
 ---@field keys            table    All finder keys (accept / mark / quickfix / preview scroll / park / abort / nav)
 ---@field marker          string   The mark indicator glyph drawn before a marked row (multi-select)
+---@field show_icons      boolean  Show file/directory icons in the finder lists (both backends)
 ---@field grep_multiline  integer|boolean The fzf grep result layout: 1 = 2-row, 2 = 2-row + gap, false/0 = 1-row
 ---@field title_pos       "left"|"center"|"right"  Finder-title alignment — every layout the same (default "center")
 ---@field statusline      boolean  Publish the finder title + counter + query to the bottom statusline
+---@field stream_slice_ms integer  Main-thread time budget (ms) of one paced stream-ingest slice (see spawn_stream)
+---@field grep_max        integer  Hard cap on collected ripgrep matches per tint grep (bounds memory; kills rg at the cap)
+---@field preview_debounce_ms integer  Settle time (ms) before the SYNC preview updates while scrolling (file previews are async, no debounce)
+---@field preview_cache      integer  How many recently previewed files the async file-preview LRU cache keeps (instant re-visits)
+---@field preview_max_lines  integer  Hard cap on lines materialised per async file preview (bounds a deep match in a huge file)
 ---@field source          table    files/directories listing engine + what it ignores (engine / exclude / hidden / …)
 ---@field icons           table    Shared glyphs used by source helpers
 ---@field icon_provider    "auto"|"lvim"|"devicons"|"mini"  Which plugin supplies file icons (via lvim-utils.icons)
@@ -67,6 +73,76 @@ return {
     -- `mkfifo` on PATH; falls back to the tint list automatically when missing.
     fzf_tui = true,
 
+    -- (tint list) DEBOUNCE the query match, in ms. The match itself is now NON-BLOCKING (lvim-fuzzy runs it
+    -- in slices across event-loop ticks and supersedes an in-flight one when you type on), so 0 = start a
+    -- fresh match on every keystroke is smooth even over millions of candidates. Raise it only to throttle
+    -- how often a match STARTS (fewer starts on very fast typing). Does not affect the fzf-TUI backend.
+    debounce_ms = 0,
+
+    -- (streamed finders — files / directories …) how often, in ms, the growing pool re-renders WHILE files are
+    -- still streaming in — this drives the live RESULT COUNT + the shown rows, so it must be small enough that
+    -- the counter ticks up smoothly (fzf-like), not in visible jumps. The parallel match (ABI 4) ranks even a
+    -- ~2M pool in tens of ms, so a fresh match every ~50 ms comfortably completes between refreshes; an empty
+    -- query (just watching the tree load) re-renders even more cheaply (first-K, no match). Raise it only if a
+    -- match at your tree size is slower than this interval (older single-threaded .so) so re-matches don't pile.
+    stream_refresh_ms = 50,
+
+    -- (streamed finders) the main-thread time budget, in ms, of ONE ingest slice while a listing streams in.
+    -- A fast producer (fd lists ~2M files in under a second) far outpaces what the editor can ingest per event-
+    -- loop pass, so stdout is queued and drained in slices of this many ms — measured around the real per-row
+    -- ingest work — with a short yield to the loop between slices (input/redraw run there). Small = smoother
+    -- but a longer total load; large = faster load but visible per-slice stutter (a slice IS a main-thread
+    -- block). ~4 ms keeps every slice well under a frame while a ~2M-file tree still loads in seconds.
+    stream_slice_ms = 4,
+
+    -- (tint list, streamed finders) how many candidates to marshal into the native matcher per slice. Feeding
+    -- a streamed pool into the engine is O(pool) Lua↔C work; doing it all at once blocks the UI (50–80 ms at
+    -- millions of paths), so it is fed in `marshal_cap`-sized slices across event-loop ticks (a background
+    -- timer catches the native context up to the pool). ~32k ≈ a 5–8 ms slice — the per-tick block. Lower for
+    -- smoother feeding on very large trees (more ticks); raise to catch up in fewer, larger (blockier) slices.
+    marshal_cap = 32768,
+
+    -- (tint grep — live AND fixed-query) the NATIVE-BLOB STORE CEILING: how many ripgrep matches the tint grep
+    -- HOLDS in the native matcher (Variant B — it keeps EVERY match like fzf keeps them in its own process, so
+    -- there is NO browse cap and the counter climbs to the REAL total). rg streams into the blob paced +
+    -- bounded: up to this many matches are STORED and browsable; a broader-than-this query is still fully
+    -- COUNTED (the count keeps climbing to the true total) but the overflow bytes are DISCARDED in the read
+    -- callback — never buffered into the editor heap → no `E41: out of memory`, ~0% main-thread block. So this
+    -- is a HIGH pathological-query safety ceiling, not a normal limit: set it above your broadest real query
+    -- (e.g. `hel` over `~/` ≈ 403k matches ≈ 32 MB native) so you practically never hit it. Native memory is
+    -- ~80 bytes/match. Only ≤`fuzzy.max_results` rows are ever materialised in Lua regardless. (Does not affect
+    -- the fzf-TUI grep — fzf owns its own result set. On an ABI < 5 library the tint grep falls back to a
+    -- bounded stream that KILLS rg at this cap, the pre-Variant-B behaviour.)
+    grep_max = 500000,
+
+    -- (tint grep) CAP on the length (bytes) of each ripgrep result line — rg's own `--max-columns`, with
+    -- `--max-columns-preview` so a too-long line is TRUNCATED (still shown) rather than omitted. A broad content
+    -- search over a huge tree hits minified bundles / caches / logs whose single line is MEGABYTES, and
+    -- `--vimgrep` prints the WHOLE matched line, so WITHOUT this cap even a few hundred k matches buffer
+    -- gigabytes into the native blob (measured: "hel" over `~/` ≈ 15 GB) and one giant append blocks the UI.
+    -- Capped, the same grep holds ~32 MB and never stalls. A grep row is never wider than the panel anyway, so
+    -- 512 is ample; raise it if you need to fuzzy-filter on text past that column. 0 disables the cap.
+    grep_max_columns = 512,
+
+    -- (tint list — SYNC in-memory previews: lsp / diagnostics / the editable file preview) settle time, in ms,
+    -- before the preview updates while SCROLLING results. Their preview is cheap but a per-move relayout is
+    -- wasteful, so it is debounced to the settle. The FILE previews (files / grep) are read ASYNC (off the main
+    -- thread, LRU-cached) and FOLLOW the cursor on every move, so they do NOT use this. Confirm always opens the
+    -- focused row regardless of whether the preview has caught up. 0 = update every move.
+    preview_debounce_ms = 60,
+
+    -- (tint FILE previews — files / grep) how many recently previewed files to keep in the async preview's LRU
+    -- cache. Re-visiting a cached file (scrolling within one grep file, or scrolling back) is INSTANT; a miss is
+    -- read off the main thread. Higher = more instant re-visits at more memory (each entry is the file's first
+    -- `preview_max_lines` lines).
+    preview_cache = 32,
+
+    -- (tint FILE previews) hard cap on the number of lines materialised per preview. The async read stops here,
+    -- so a match DEEP in a huge file (a minified bundle, a log) never sets tens of thousands of lines on the
+    -- main thread — the preview shows the file up to this line (the focus clamps). Comfortably covers normal
+    -- source files; raise it if you routinely preview matches past this line in large files.
+    preview_max_lines = 2000,
+
     -- (fzf finders) ALL terminal keys — every one configurable. Editor-side keys (preview scroll, park,
     -- quickfix) are handled by Neovim; the rest pass straight to fzf with its own bindings. The fzf-internal
     -- actions (mark, quickfix-accept) also get the matching fzf `--bind` / `--expect` wiring automatically.
@@ -75,6 +151,16 @@ return {
         accept = "<CR>", -- open / confirm the focused item
         mark = "<Tab>", -- toggle the focused row's mark (multi-select)
         quickfix = "<C-q>", -- send every marked row (or the focused one) to the quickfix list, then close
+        -- (LIVE tint grep) toggle GREP ⇄ FILTER mode: GREP mode = the typed query drives ripgrep (live search);
+        -- FILTER mode = ripgrep is FROZEN at the current results and the typed query fuzzy-filters that loaded
+        -- set (no re-grep). Bound in both the query input and the normal-mode list; no-op outside the live grep.
+        grep_filter = "<C-g>",
+        -- SWAP the current finder's backend: the tint list ⇄ the fzf-TUI (only for the command-driven finders
+        -- that have both — files / grep / buffers / directories / git_files). Reopens the same finder in the
+        -- other backend in place; the query is not carried (retype). Bound ONLY inside the picker. A single
+        -- TOGGLE key (there are only two backends). NOTE: `<C-[>` is the terminal code for <Esc>, so it can't be
+        -- used here (it would shadow Esc/abort) — pick a non-Esc chord if you rebind.
+        swap_backend = { "<C-]>" },
         preview_down = "<C-d>", -- scroll the preview down
         preview_up = "<C-u>", -- scroll the preview up
         -- PARK: a focus toggle that keeps the finder OPEN. In fzf's input it focuses the editor (the real
@@ -97,6 +183,8 @@ return {
     -- The MARK indicator drawn in the one blank column in front of a marked row (multi-select), in red — both
     -- backends. The canonical pointer glyph `➤` (U+27A4) reads cleanly in that single space.
     marker = "➤",
+    -- Show file/directory icons in the finder lists (both backends); false = plain text rows.
+    show_icons = true,
     -- Which icon plugin supplies file glyphs (both backends), resolved through lvim-utils.icons:
     -- "auto" prefers lvim-icons, then nvim-web-devicons, then mini.icons, else no icons.
     icon_provider = "auto",
@@ -174,6 +262,10 @@ return {
     prompt = {
         icon = "➤", -- the leading glyph (the canon pointer; set your own nf glyph via setup, or "" for none)
         label = "", -- optional text after the icon (e.g. "Search"); "" for none
+        -- (live grep only) the badge shown while <C-g> FILTER mode is active (rg frozen, the query fuzzy-filters
+        -- the loaded results) — so the search bar itself signals the mode, not just the title. Same spacing.
+        filter_icon = "󰈲", -- nf-md-filter
+        filter_label = "Filter",
         -- Spacing around the badge (all configurable): `pad_left` before the icon, `icon_gap` between the
         -- icon and the label (only when both are present), `pad_right` after the icon/label (all on the
         -- badge's strong tint), `input_gap` between the badge and the typed text (on the input's light tint).
