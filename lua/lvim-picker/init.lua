@@ -1105,6 +1105,10 @@ build = function(opts, kind)
                         swap_backend("tint", opts)
                     end)
                 end
+                -- the keymap CHEATSHEET (normal mode only — in the prompt `g?` would type into the query).
+                map(keylist(kcfg.help), function()
+                    require("lvim-picker.help").show(opts.keys) -- + THIS finder's per-call row actions
+                end)
                 -- back to typing: `/` + <C-f> (NOT i/a — a consumer filter may own those, e.g. diagnostics).
                 map({ "/", "<C-f>" }, focus_input)
                 map({ "q", "<Esc>" }, cancel)
@@ -1805,6 +1809,8 @@ build = function(opts, kind)
                 { key = "j/k", name = "move" },
                 { key = klabel(kcfg.mark), name = "mark" },
                 { key = klabel(kcfg.quickfix), name = "qf" },
+                -- the cheatsheet: on the LIST only (in the prompt the key would type into the query)
+                { key = klabel(kcfg.help), name = "help" },
             }
         else -- prompt (insert): C-j/k move the selection while you type
             items = {

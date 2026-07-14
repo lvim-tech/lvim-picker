@@ -1180,6 +1180,15 @@ function M.open(opts)
                 end
             end
         end
+        -- NORMAL: the keymap CHEATSHEET (`g?`). The fzf TUI runs in a HOSTED terminal buffer the chassis never
+        -- maps, so it cannot own the `g` chord prefix itself — `surface.own_chords` is the shared seam that
+        -- does (without it a `g?` typed at human speed falls through to the builtin `g` after `timeoutlen`).
+        for _, lhs in ipairs(keylist(kcfg.help)) do
+            vim.keymap.set("n", lhs, function()
+                require("lvim-picker.help").show(opts.keys) -- + THIS finder's per-call row actions
+            end, kopts)
+            surface.own_chords(tbuf, { lhs })
+        end
         -- NORMAL: <C-d>/<C-u> scroll the PREVIEW (as in insert); every OTHER Neovim scroll/page motion is blocked
         -- so it can't scroll the fzf terminal render under us (which would move the cursor + corrupt the display).
         if opts.preview then
@@ -1340,6 +1349,15 @@ function M.open(opts)
         mark = { key = klabel(kcfg.mark), name = "mark" },
         qf = { key = klabel(kcfg.quickfix), name = "qf" },
         close = { n = klabel(kcfg.abort) .. "/q", i = klabel(kcfg.abort), name = "close" },
+        -- The cheatsheet — a NORMAL-mode-only chip (in insert the key would type into the query), so only the
+        -- `n` label is set: `surface.bar` drops a record with no key in the mode it renders.
+        help = {
+            n = klabel(kcfg.help),
+            name = "help",
+            run = function()
+                require("lvim-picker.help").show(opts.keys)
+            end,
+        },
     }
     -- open-method entries only when the method is a real `{ n, i }` table (a user may disable one by
     -- overriding it to false / a string) — indexing `om.vsplit.n` unconditionally crashed on such overrides,

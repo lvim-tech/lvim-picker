@@ -60,6 +60,13 @@ pick.commands()
 pick.colorschemes()
 ```
 
+### Keymap cheatsheet
+
+Press **`<Esc>`** (off the query, onto the list) and then **`g?`** — or click the **`help` chip** on the
+footer bar — for the keymap CHEATSHEET: every finder key, built from the live `keys` config below (rebind
+one and the cheatsheet follows). It works in BOTH backends (the tint list and the fzf TUI). `q` / `<Esc>` /
+`g?` close it. The key is normal-mode only on purpose: while you type, the query owns the keyboard.
+
 ## Grep
 
 The Lua **tint grep** (`fzf_tui = false`, and every plugin using it) holds **all** ripgrep matches in the
@@ -193,10 +200,14 @@ require("lvim-picker").setup({
     preview_max_lines = 2000,
     -- All finder keys (a value is a single key or a list; "" / {} disables it).
     keys = {
+        -- (NORMAL mode only — while you type, the query owns the keyboard) the keymap CHEATSHEET, built
+        -- from this table; also a `help` chip on the finder's footer bar in normal mode.
+        help = "g?",
         accept = "<CR>", -- open / confirm the focused item
         mark = "<Tab>", -- toggle the focused row's mark (multi-select)
         quickfix = "<C-q>", -- send marked (or focused) rows to the quickfix list, then close
         grep_filter = "<C-g>", -- (live tint grep) toggle GREP ⇄ FILTER mode: drive rg vs fuzzy-filter the loaded set
+        swap_backend = { "<C-]>" }, -- swap the backend of the current finder (tint list ⇄ fzf TUI)
         preview_down = "<C-d>", -- scroll the preview down
         preview_up = "<C-u>", -- scroll the preview up
         park = "<C-o>", -- focus the editor without closing the finder; the same key returns
@@ -231,6 +242,7 @@ require("lvim-picker").setup({
         normal = {
             { "open", "vsplit", "hsplit" },
             { "move", "mark", "qf", "close", "preview" },
+            { "help" }, -- the cheatsheet chip (normal only — in insert the key would type into the query)
             { "sectors" },
         },
     },

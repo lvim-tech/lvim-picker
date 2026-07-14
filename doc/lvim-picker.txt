@@ -57,6 +57,14 @@ a Lua function: >vim
     local pick = require("lvim-picker")
     pick.files()  pick.grep()  pick.buffers()  pick.git_files()  pick.marks()
 <
+KEYMAP CHEATSHEET                                              *lvim-picker-help*
+
+<Esc> (off the query, onto the list) then `g?` — or the `help` chip on the footer
+bar — opens the keymap CHEATSHEET: every finder key, built from the live `keys`
+config, in BOTH backends (the tint list and the fzf TUI). `q` / <Esc> / `g?`
+close it. The key is NORMAL-mode only on purpose: while you type, the query owns
+the keyboard.
+
 ==============================================================================
 5. DOCK STACK                                                  *lvim-picker-dock*
 

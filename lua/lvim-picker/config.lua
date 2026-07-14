@@ -148,6 +148,9 @@ return {
     -- actions (mark, quickfix-accept) also get the matching fzf `--bind` / `--expect` wiring automatically.
     -- A value may be a single key or a LIST of keys (all bound to that action). "" / {} disables an action.
     keys = {
+        -- (NORMAL mode only — while you type, the query owns the keyboard) the keymap CHEATSHEET, built from
+        -- THIS table, so a rebind shows up in it. Also a `help` chip on the finder's footer bar.
+        help = "g?",
         accept = "<CR>", -- open / confirm the focused item
         mark = "<Tab>", -- toggle the focused row's mark (multi-select)
         quickfix = "<C-q>", -- send every marked row (or the focused one) to the quickfix list, then close
@@ -214,6 +217,7 @@ return {
         normal = {
             { "open", "vsplit", "hsplit" },
             { "move", "mark", "qf", "close", "preview" },
+            { "help" }, -- the cheatsheet (normal mode only — `g?` would type into the query in insert)
             { "sectors" }, -- core frame-nav (C-j/C-k step sectors in normal; in insert they are fzf's list nav)
         },
     },
