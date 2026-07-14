@@ -67,6 +67,16 @@ footer bar — for the keymap CHEATSHEET: every finder key, built from the live 
 one and the cheatsheet follows). It works in BOTH backends (the tint list and the fzf TUI). `q` / `<Esc>` /
 `g?` close it. The key is normal-mode only on purpose: while you type, the query owns the keyboard.
 
+## The query
+
+A **space separates TERMS** — the fzf convention. `conf ui` means "matches `conf` **and** matches `ui`", in any
+order; each term is matched fuzzily on its own and every term's characters are highlighted. A query with no
+space is a single term, and a trailing space changes nothing (`conf ` still searches for `conf`) — typing a
+space can never blank the result list.
+
+This holds for both matching paths: the in-memory finders and the streamed (blob) ones. A **live grep** is a
+different thing — there the query is handed to ripgrep, which has its own syntax.
+
 ## Grep
 
 The Lua **tint grep** (`fzf_tui = false`, and every plugin using it) holds **all** ripgrep matches in the
@@ -154,7 +164,9 @@ require("lvim-picker").setup({
     -- Default layout for every finder: "area" (message zone) | "float" (centred) | "bottom" (dock).
     layout = "area",
     -- The tint-list finder's max visible rows (a secondary cap under the dock geometry height).
-    max_rows = 15,
+    -- nil = follow the ONE central authority (lvim-utils `dock.geometry.<layout>.height`), like every other
+    -- panel; set a number only to cap THIS plugin's lists shorter than the dock allows.
+    max_rows = nil,
     -- This plugin's OWN docking defaults, namespaced under `dock` (per-call opts.dock_stack / opts.force
     -- still override these for a single open).
     dock = {
@@ -199,6 +211,10 @@ require("lvim-picker").setup({
     -- (tint FILE previews) hard cap on lines materialised per preview (bounds a deep match in a huge file).
     preview_max_lines = 2000,
     -- All finder keys (a value is a single key or a list; "" / {} disables it).
+    -- Extra row actions: `{ key, name?, mode?, run(item, close) }`. `name` adds a footer hint. `mode`
+    -- restricts the binding to ONE context — "n" = the LIST only, "i" = the PROMPT only, absent = both.
+    -- A key that also EDITS the query (<BS>, a bare letter) must be declared `mode = "n"`, or it would be
+    -- bound in insert too and steal the keystroke from typing.
     keys = {
         -- (NORMAL mode only — while you type, the query owns the keyboard) the keymap CHEATSHEET, built
         -- from this table; also a `help` chip on the finder's footer bar in normal mode.

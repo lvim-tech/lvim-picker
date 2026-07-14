@@ -517,7 +517,7 @@ end
 ---@field preview? fun(item: any): string[], string?, integer?  preview lines (+ a filetype, + a 1-based focus line) per selection (SYNCHRONOUS, in-memory finders)
 ---@field preview_file_of? fun(item: any): { path: string, lnum?: integer, ft?: string }?  map an item to a FILE location previewed ASYNC (read off the main thread, LRU-cached) so the preview follows the cursor while scrolling; used by files/grep
 ---@field preview_file? boolean  preview the item's REAL file buffer (EDITABLE, 2-way synced) instead of `preview` lines; items need `path` (+ lnum/col)
----@field preview_side? "right"|"left"|"below"|"above"|"dynamic"|"hide"  where the preview sits (default "right"); below/above stack; `dynamic` = full-width list + a peek float above (native-qf style); `hide` = no preview (toggle with <C-e>)
+---@field preview_side? "right"|"left"|"dynamic"|"hide"  where the preview sits (default "right"); `dynamic` = full-width list + a peek float above it (native-qf style); `hide` = no preview (toggle with <C-e>)
 ---@field preview_numbers? boolean  show line numbers in the preview (default true)
 ---@field preview_wrap? boolean  soft-wrap the preview (default false)
 ---@field list_wrap? boolean  soft-wrap the list rows (no "↳" marker) so far-right matches stay visible (default false)
@@ -529,12 +529,12 @@ end
 ---@field title_pos? "left"|"center"|"right"  title alignment override for THIS open (default: `config.title_pos`, layout-independent)
 ---@field counter? string  match-count placement: "footer" (default — the bottom-right border) | "title" (folded into the border-title)
 ---@field prompt? string  the query prompt prefix (default "➤ ")
----@field keys? { key: string, name?: string, run: fun(item: any, close: fun()) }[]  extra row actions (split, code action…); `name` adds a footer hint
+---@field keys? { key: string, name?: string, mode?: "n"|"i", run: fun(item: any, close: fun()) }[]  extra row actions (split, code action…); `name` adds a footer hint; `mode` restricts the binding to the LIST (n) or the PROMPT (i) — absent = both
 ---@field filters? LvimUiFilterGroup[]  header filter button GROUPS — each `{ active = id, buttons = { { id, label, key?, predicate?(src), hl?, hl_active?, hl_hover_active? }, … } }`; activate a filter by its key in NORMAL mode
 ---@field refresh? fun(): any[]  re-fetch the static items live (e.g. on DiagnosticChanged) — see refresh_events
 ---@field refresh_events? string[]  autocmd events that trigger a refresh
 ---@field close_on_empty? boolean  dismiss the finder when a refresh leaves no items (e.g. all diagnostics fixed)
----@field max_rows? integer  natural list/preview height hint (default 15)
+---@field max_rows? integer  OPTIONAL local row cap; nil = follow the central dock geometry height
 ---@field layout? "float"|"bottom"|"area"  centred float (default), a bottom dock, or the cmdheight area (heirline above)
 ---@field height? integer  rows for the bottom layout (default 16)
 ---@field key? string  the dock KIND key — this finder's stable identity in the dock stack (id = "lvim-picker:"..key); nil ⇒ derived from the title, else un-managed
@@ -565,7 +565,11 @@ build = function(opts, kind)
     end
     local surface = require("lvim-ui.surface")
     local items = normalize(opts.items, opts.format)
-    local maxr = opts.max_rows or config.max_rows
+    -- No local cap by default: the panel content-fits and the CENTRAL dock geometry height caps it (the chassis
+    -- clamps `auto` sizing to `dock.geometry.<layout>.height`). A number here (config or per call) is a
+    -- deliberate LOCAL limit under that ceiling. `math.huge` would break `math.min` on integers, so use the
+    -- screen height as the "no cap" value — the chassis clamps it down anyway.
+    local maxr = opts.max_rows or config.max_rows or vim.o.lines
     local state = {
         filtered = items,
         sel = 1,
@@ -1008,7 +1012,9 @@ build = function(opts, kind)
                 if (opts.source or state.blob) and not it._match_done then
                     local q = state.live_query
                     if q and q ~= "" then
-                        it.match = utils.match_indices(q, it.text)
+                        -- through the shared term matcher, so a multi-term query lights up EVERY term (the
+                        -- filter and the highlight must agree on what matched — see fuzzy.match_terms)
+                        it.match = fuzzy.match_terms(q, it.text)
                     end
                     it._match_done = true
                 end
@@ -1113,9 +1119,14 @@ build = function(opts, kind)
                 map({ "/", "<C-f>" }, focus_input)
                 map({ "q", "<Esc>" }, cancel)
                 for _, a in ipairs(opts.keys or {}) do
-                    map(a.key, function()
-                        act(a.run)
-                    end)
+                    -- `mode` restricts a row action to ONE context (absent = both). A key that also EDITS the
+                    -- query (<BS>, a letter) is declared `mode = "n"` by its consumer so it acts on the list but
+                    -- still types in the prompt.
+                    if a.mode ~= "i" then
+                        map(a.key, function()
+                            act(a.run)
+                        end)
+                    end
                 end
             end
         end,
@@ -1791,8 +1802,8 @@ build = function(opts, kind)
     -- MODE-AWARE footer legend. The move keys differ by focus — in the PROMPT (insert) `C-j`/`C-k` move the
     -- selection (`j`/`k` would type); in the NORMAL list `j`/`k` move and the filter hotkeys (`Tab` mark,
     -- `<C-q>` qf) activate directly. So the footer is rebuilt on every prompt⇄list switch via `set_footer`, and
-    -- shows the keys that ACTUALLY work in the current context. `<C-f>` flips the two (→ list from the prompt,
-    -- → typing from the list). Config-bound keys are labelled from their live `config.keys` value.
+    -- shows the keys that ACTUALLY work in the current context. `<C-f>` is the FOCUS toggle between them (labelled
+    -- "focus" in both). Config-bound keys are labelled from their live `config.keys` value.
     local function klabel(k)
         if type(k) == "table" then
             k = k[1]
@@ -1822,14 +1833,17 @@ build = function(opts, kind)
             items[#items + 1] = { key = "C-d/u", name = "preview" }
         end
         for _, a in ipairs(opts.keys or {}) do
-            if a.name then
+            -- a `mode`-restricted row action is only hinted in the context it actually works in
+            if a.name and (a.mode == nil or a.mode == (ctx == "list" and "n" or "i")) then
                 items[#items + 1] = { key = a.key, name = a.name }
             end
         end
         if opts.grep and opts.grep.live then
             items[#items + 1] = { key = klabel(kcfg.grep_filter), name = "grep⇄filter" }
         end
-        items[#items + 1] = { key = "C-f", name = ctx == "list" and "type" or "list" } -- flip prompt⇄list
+        -- ONE name in both contexts: `C-f` is a FOCUS toggle (prompt ⇄ list), not two separate commands. Naming it
+        -- after its destination ("list" / "type") read as if the picker had two different keys there.
+        items[#items + 1] = { key = "C-f", name = "focus" }
         items[#items + 1] = { key = "C-c", name = "close" }
         return items
     end
@@ -1885,10 +1899,10 @@ build = function(opts, kind)
     -- (position="cmdline" + no explicit host): the zone reserves rows above the messages, the surface follows
     -- the rect, and the engine wires the descend (`on_escape_below`) + release. The picker never references
     -- msgarea; `area` alone gates the `C-j msgs` footer hint below.
-    -- preview side: where the preview panel sits relative to the list. right/left → side-by-side; below/
-    -- above → stacked (the surface grows its height — see ui.surface `direction = "vertical"`).
+    -- preview side: where the preview panel sits relative to the list — `right` / `left` (side by side) or
+    -- `dynamic` (a peek FLOAT above a full-width list). Vertical DOCKED stacking is gone: the two panels then
+    -- split the dock's rows and neither is readable.
     local side = opts.preview_side or "right"
-    local vertical = side == "below" or side == "above"
     -- BOTH data panels — the LIST and the PREVIEW — carry the single-source content ring (`surface.CONTENT_BORDER`,
     -- resolved live to `ui_config.content_border` at open time), so they read as two matching nested frames. The
     -- scoped INPUT prompt overlays the list's first (winbar) row but the surface places scoped bands INSIDE the
@@ -1973,7 +1987,7 @@ build = function(opts, kind)
     local blocks
     if not preview_block then
         blocks = { list_block }
-    elseif side == "left" or side == "above" then
+    elseif side == "left" then
         blocks = { preview_block, list_block }
     else
         blocks = { list_block, preview_block }
@@ -2050,7 +2064,6 @@ build = function(opts, kind)
         -- 210 (above the zone's own panels), so this base only applies to the zone-off case.
         zindex = area and 200 or nil,
         header_air = false, -- no LEADING air row; the filter bar (or the input prompt) is the top content row
-        direction = vertical and "vertical" or nil,
         preview_side = preview_provider and side or nil, -- so the surface can rotate the preview live (C-n/C-p)
         lock_keys = true, -- modal list: only the bound keys act; every other key is a no-op (the editable preview is exempt)
         title = title_box, -- the chassis native centered border-title
@@ -2143,10 +2156,15 @@ build = function(opts, kind)
                         -- consumer row actions: `opts.keys = { { key = lhs, run = fn(item, close) } }` — e.g.
                         -- open in a split, run a code action, yank. `run` gets the selected item + a close fn.
                         for _, a in ipairs(opts.keys or {}) do
-                            imap(a.key, function()
-                                vim.cmd("stopinsert")
-                                act(a.run)
-                            end)
+                            -- Honour `mode`: a consumer that declared `mode = "n"` (e.g. lvim-space's <BS> =
+                            -- "step back to the panel") means the LIST only — binding it here stole <BS> from the
+                            -- query, so a backspace left insert mode instead of deleting a character.
+                            if a.mode ~= "n" then
+                                imap(a.key, function()
+                                    vim.cmd("stopinsert")
+                                    act(a.run)
+                                end)
+                            end
                         end
                     end,
                 }

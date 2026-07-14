@@ -250,7 +250,7 @@ end
 ---@field title_line? string  title placement: "row" (a top content row, default) | "statusline" (the centralized chrome overlay) | "border" (opt-in native border-title)
 ---@field title_pos? "left"|"center"|"right"  title alignment override for THIS open (default: `config.title_pos`, layout-independent)
 ---@field counter? string  match-count placement: "footer" (default — the bottom-right border) | "title" (folded into the border-title)
----@field preview_side? string  where the preview panel sits: "right" (default) | "left" | "above" | "below"
+---@field preview_side? string  where the preview panel sits: "right" (default) | "left"
 ---@field cmd? string[]  the producer argv (FZF_DEFAULT_COMMAND): fzf runs + streams it (files / dirs / git)
 ---@field contents? string[]  a STATIC candidate list (e.g. buffers) — fed to fzf via a temp file
 ---@field reload? string  a shell command with a literal `{q}` placeholder (grep): fzf RE-RUNS it per keystroke
@@ -403,14 +403,12 @@ function M.open(opts)
         -- Key on the actual PANEL footprints (list = matches + fzf prompt row; preview = preview_rows, which
         -- already floors at the winbar minimum) so the key tracks the real area height.
         local lr, fr = list_rows() + 1, preview_rows()
-        -- The auto-fit AREA height is driven by the panel STACK, not the raw pair: side-by-side (right/left) →
-        -- the TALLER panel (max); stacked (above/below) → their SUM. Key on THAT, so moving onto a file whose
-        -- row count changes but does NOT change the area height (a long list dwarfing a shorter preview → max
-        -- unchanged) does NOT relayout — which is what made the whole panel flicker on J/K. The preview CONTENT
-        -- still updates via render_preview (on_focus); only the needless relayout is skipped.
-        local side = (state.st and state.st.preview_side) or opts.preview_side or "right"
-        local vertical = side == "above" or side == "below"
-        local key = vertical and (lr + fr) or math.max(lr, fr)
+        -- The auto-fit AREA height is driven by the panel pair: the panels sit SIDE BY SIDE, so the height is
+        -- the TALLER of them. Key on THAT, so moving onto a file whose row count changes but does NOT change the
+        -- area height (a long list dwarfing a shorter preview → max unchanged) does NOT relayout — which is what
+        -- made the whole panel flicker on J/K. The preview CONTENT still updates via render_preview (on_focus);
+        -- only the needless relayout is skipped.
+        local key = math.max(lr, fr)
         if key ~= last_fit and state.st and state.st.relayout then
             last_fit = key
             state.st.relayout()

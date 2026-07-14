@@ -246,6 +246,19 @@ local function ensure_ctx(texts)
     return ctx
 end
 
+--- Split a query into its whitespace-separated TERMS (fzf's AND semantics). A query with no whitespace is one
+--- term; trailing / repeated spaces collapse, so "ini " is still the single term "ini" (typing a space mid-word
+--- must not blank the list).
+---@param query string
+---@return string[]
+local function query_terms(query)
+    local out = {}
+    for t in tostring(query or ""):gmatch("%S+") do
+        out[#out + 1] = t
+    end
+    return out
+end
+
 --- Rank `texts` against `query`. `cb` receives a list of `{ idx, match? }` in ranked order — `idx` is the
 --- 1-based index into `texts`, `match` the 0-based matched-char indices (for highlighting; absent on an
 --- empty query). Empty query = the first `max_results` in source order, no match. The match itself is a
@@ -266,7 +279,8 @@ function M.filter(texts, query, cb)
             return texts[r.idx]
         end))
     end
-    if query == "" then
+    if #query_terms(query) == 0 then
+        -- "" or only spaces — the same thing: the whole pool, unranked
         _last_query, _last_cb = nil, nil -- an empty query needs no full-pool replay when the marshal catches up
         local out = {}
         for i = 1, math.min(#texts, max) do -- first `max` in source order (no matching on an empty query)
@@ -285,11 +299,60 @@ function M.filter(texts, query, cb)
     -- is already gen-guarded, and the callers were wired for the original async engine). On an ABI < 3 / Lua
     -- backend it degrades to a scheduled synchronous match. Positions are computed for the returned top rows
     -- only (~max_results — cheap), never over the whole candidate set.
-    engine.match_async(query, ensure_ctx(texts), function(results, cnt)
+    -- WHITESPACE = AND (the fzf convention every picker user expects): "conf ui" means "matches `conf` AND
+    -- matches `ui`", in any order — not the literal string "conf ui", which as a subsequence needs a real space
+    -- in the path and therefore matched NOTHING (typing a space wiped the result list). The engine takes ONE
+    -- needle, so the most SELECTIVE term (the longest) drives it and the rest AND-filter its rows here; the
+    -- highlight is the union of every term's positions. Single-term queries take the plain path unchanged.
+    local terms = query_terms(query)
+    if #terms > 1 then
+        local lead = terms[1]
+        for _, t in ipairs(terms) do
+            if #t > #lead then
+                lead = t
+            end
+        end
+        engine.match_async(lead, ensure_ctx(texts), function(results, cnt)
+            local out = {}
+            for k = 1, cnt do
+                if #out >= max then
+                    break
+                end
+                local idx = results[k].index
+                local text = texts[idx]
+                local hits, ok = {}, true
+                for _, t in ipairs(terms) do
+                    local m = utils.match_indices(t, text)
+                    if not m then
+                        ok = false
+                        break
+                    end
+                    for _, ci in ipairs(m) do
+                        hits[ci] = true
+                    end
+                end
+                if ok then
+                    local match = {}
+                    for ci in pairs(hits) do
+                        match[#match + 1] = ci
+                    end
+                    table.sort(match)
+                    out[#out + 1] = { idx = idx, match = match }
+                end
+            end
+            deliver(out)
+        end)
+        return
+    end
+
+    -- ONE term: the needle is the TERM, not the raw query — "ini " (a space typed mid-thought) must search for
+    -- "ini", not for the literal "ini " (which no path contains, so the list went blank on the space).
+    local needle = terms[1]
+    engine.match_async(needle, ensure_ctx(texts), function(results, cnt)
         local out = {}
         for k = 1, math.min(cnt, max) do
             local idx = results[k].index
-            out[k] = { idx = idx, match = utils.match_indices(query, texts[idx]) }
+            out[k] = { idx = idx, match = utils.match_indices(needle, texts[idx]) }
         end
         deliver(out)
     end)
@@ -357,6 +420,38 @@ function M.blob_free(blob)
     engine.blob_free(blob)
 end
 
+--- The matched-char indices of `text` for a (possibly multi-TERM) query — the union of every term's positions,
+--- or nil when any term fails. The one place the picker's highlight and its filtering agree on what "matched"
+--- means, so a space in the query lights up both words instead of nothing.
+---@param query string
+---@param text string
+---@return integer[]|nil
+function M.match_terms(query, text)
+    local terms = query_terms(query)
+    if #terms == 0 then
+        return nil
+    end
+    if #terms == 1 then
+        return utils.match_indices(terms[1], text)
+    end
+    local hits = {}
+    for _, t in ipairs(terms) do
+        local m = utils.match_indices(t, text)
+        if not m then
+            return nil
+        end
+        for _, ci in ipairs(m) do
+            hits[ci] = true
+        end
+    end
+    local out = {}
+    for ci in pairs(hits) do
+        out[#out + 1] = ci
+    end
+    table.sort(out)
+    return out
+end
+
 --- Rank `blob` against `query` and hand the ranked results (`{ idx, text }`, `idx` = the 1-based NATIVE
 --- candidate index, `text` materialised for rendering / sorting) to `cb`, plus `total` = the TRUE number of
 --- candidates that matched (before the `max_results` cap; the whole pool for an empty query) so the finder can
@@ -369,18 +464,42 @@ end
 ---@param cb fun(list: { idx: integer, text: string }[], total: integer)
 function M.blob_filter(blob, query, cb)
     local max = (config or {}).max_results or 1000
-    engine.blob_match(blob, query, function(results, cnt, total)
-        local lim = math.min(cnt, max)
+    -- Same AND semantics as the in-memory path (`M.filter`): whitespace separates TERMS. The blob matcher takes
+    -- ONE needle, so the most selective term (the longest) drives the native match and the rest AND-filter its
+    -- rows here. A single term is passed TRIMMED, so a trailing space cannot blank the list.
+    local terms = query_terms(query)
+    local needle = terms[1] or ""
+    for _, t in ipairs(terms) do
+        if #t > #needle then
+            needle = t
+        end
+    end
+    engine.blob_match(blob, needle, function(results, cnt, total)
         local ranked = {}
-        for k = 1, lim do
+        for k = 1, cnt do
+            if #ranked >= max then
+                break
+            end
             local idx = results[k].index
-            ranked[k] = { idx = idx, text = engine.blob_text(blob, idx) or "" }
+            local text = engine.blob_text(blob, idx) or ""
+            local ok = true
+            if #terms > 1 then
+                for _, t in ipairs(terms) do
+                    if not utils.match_indices(t, text) then
+                        ok = false
+                        break
+                    end
+                end
+            end
+            if ok then
+                ranked[#ranked + 1] = { idx = idx, text = text }
+            end
         end
         cb(
             apply_sort(ranked, function(r)
                 return r.text
             end),
-            total or lim
+            (#terms > 1) and #ranked or (total or #ranked)
         )
     end)
 end
