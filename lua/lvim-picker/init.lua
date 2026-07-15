@@ -1813,6 +1813,10 @@ build = function(opts, kind)
     ---@param ctx "prompt"|"list"
     ---@return table[]  the footer item list for this focus context
     build_footer = function(ctx)
+        -- ONE run of hints for everything the picker does — no group boxes between open / move / mark / preview /
+        -- focus / close. The ONLY exception is the cheatsheet: `help` is pulled to the very end and set apart by a
+        -- single `●` (config.footer_separator, `LvimUiFooterSep`), so "where the full key list is written down"
+        -- reads as its own thing rather than one hint among the actions.
         local items
         if ctx == "list" then
             items = {
@@ -1820,8 +1824,6 @@ build = function(opts, kind)
                 { key = "j/k", name = "move" },
                 { key = klabel(kcfg.mark), name = "mark" },
                 { key = klabel(kcfg.quickfix), name = "qf" },
-                -- the cheatsheet: on the LIST only (in the prompt the key would type into the query)
-                { key = klabel(kcfg.help), name = "help" },
             }
         else -- prompt (insert): C-j/k move the selection while you type
             items = {
@@ -1844,7 +1846,19 @@ build = function(opts, kind)
         -- ONE name in both contexts: `C-f` is a FOCUS toggle (prompt ⇄ list), not two separate commands. Naming it
         -- after its destination ("list" / "type") read as if the picker had two different keys there.
         items[#items + 1] = { key = "C-f", name = "focus" }
-        items[#items + 1] = { key = "C-c", name = "close" }
+        -- CLOSE is context-aware, because the keys are: the PROMPT (insert) cancels with `<C-c>`; on the LIST
+        -- (normal) `q` / `<Esc>` close (there `<C-c>` does nothing, and `<Esc>` from the prompt drops to the list
+        -- rather than closing). The footer used to say `C-c` in both, so the hint was wrong the moment you left
+        -- the input.
+        items[#items + 1] = ctx == "list" and { key = "q/Esc", name = "close" } or { key = "C-c", name = "close" }
+        -- help LAST, in its own group: a `●` separator, then the cheatsheet key. LIST context only — in the prompt
+        -- the key would type into the query.
+        if ctx == "list" then
+            local sep = (config or {}).footer_separator or "●"
+            items[#items + 1] =
+                { type = "separator", text = sep, style = { padding = { 1, 1 }, hl = "LvimUiFooterSep" } }
+            items[#items + 1] = { key = klabel(kcfg.help), name = "help" }
+        end
         return items
     end
     local function set_footer_ctx(ctx)
