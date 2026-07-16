@@ -3366,6 +3366,32 @@ local FINDERS = {
 }
 local LAYOUTS = { "area", "float", "bottom" }
 
+--- The finder CHOOSER — fzf-lua's builtin-menu equivalent: a native lvim-picker finder listing every built-in
+--- finder (label + Nerd glyph from `KIND_META`), opened when `:LvimPicker` is called with NO finder. It IS a
+--- picker, so it honours `layout` (the chooser AND the finder it opens both land in that layout). The `grep_*`
+--- context variants (cword/selection/…) are keymap-oriented, not menu rows, so they are omitted.
+---@param layout? string  "area" | "float" | "bottom" (nil = the config default)
+local function open_chooser(layout)
+    local items = {}
+    for _, kind in ipairs(FINDERS) do
+        local km = KIND_META[kind]
+        if km and not kind:match("^grep_") then
+            items[#items + 1] = { text = km.icon .. "  " .. km.name, kind = kind }
+        end
+    end
+    pick_items({
+        title = "Pickers",
+        items = items,
+        opts = layout and { layout = layout } or nil,
+        on_confirm = function(item)
+            local fn = item and item.kind and M[item.kind]
+            if type(fn) == "function" then
+                fn(layout and { layout = layout } or nil)
+            end
+        end,
+    })
+end
+
 --- Configure lvim-picker: merge `opts` into the live picker config in place (a nested `fuzzy` subtable merges
 --- into the fuzzy engine's config), then register the `:LvimPicker` command. Optional — the defaults work
 --- without it; every reader `require("lvim-picker.config")` sees the effective values.
@@ -3383,29 +3409,42 @@ end
 --- Register the `:LvimPicker <finder> [layout]` user command (one finder per `M.<finder>` above).
 function M.setup_command()
     vim.api.nvim_create_user_command("LvimPicker", function(o)
-        local finder = o.fargs[1]
+        -- A layout token (area|float|bottom) may appear ANYWHERE in the args; the remaining word (if any) is
+        -- the finder. No finder → the chooser (fzf-lua's builtin menu). No layout → the config default.
+        local finder, layout
+        for _, w in ipairs(o.fargs) do
+            if not layout and vim.tbl_contains(LAYOUTS, w) then
+                layout = w
+            elseif not finder then
+                finder = w
+            end
+        end
+        if not finder then
+            open_chooser(layout)
+            return
+        end
         local fn = M[finder]
         if type(fn) ~= "function" then
             vim.notify("LvimPicker: unknown finder '" .. tostring(finder) .. "'", vim.log.levels.ERROR)
             return
         end
-        fn(o.fargs[2] and { layout = o.fargs[2] } or nil)
+        fn(layout and { layout = layout } or nil)
     end, {
-        nargs = "+",
+        nargs = "*",
         complete = function(arg_lead, cmd_line, _)
             local parts = vim.split(cmd_line, "%s+")
+            -- first token: a finder OR a layout (`:LvimPicker float` is valid); after a finder: the layout.
+            local pool = {}
             if #parts <= 2 then
-                return vim.tbl_filter(function(n)
-                    return n:find(arg_lead, 1, true) == 1
-                end, FINDERS)
+                pool = vim.list_extend(vim.deepcopy(FINDERS), LAYOUTS)
             elseif #parts == 3 then
-                return vim.tbl_filter(function(l)
-                    return l:find(arg_lead, 1, true) == 1
-                end, LAYOUTS)
+                pool = LAYOUTS
             end
-            return {}
+            return vim.tbl_filter(function(n)
+                return n:find(arg_lead, 1, true) == 1
+            end, pool)
         end,
-        desc = "LvimPicker — open a finder (:LvimPicker <finder> [area|float|bottom])",
+        desc = "LvimPicker — pick a finder (:LvimPicker [<finder>] [area|float|bottom]); no finder opens the chooser",
     })
 end
 
