@@ -245,6 +245,7 @@ end
 -- ─── open ─────────────────────────────────────────────────────────────────────
 
 ---@class LvimFzfOpts
+---@field replace_before_close? boolean  route the accept/cancel callback BEFORE closing the finder — the callback re-opens a dock that evicts this finder in the background (no editor focus-fall). See LvimPickerOpts.
 ---@field title? string  the finder title — the chassis native centered border-title
 ---@field icon? string  an optional leading glyph fronting the title
 ---@field title_line? string  title placement: "row" (a top content row, default) | "statusline" (the centralized chrome overlay) | "border" (opt-in native border-title)
@@ -793,21 +794,34 @@ function M.open(opts)
         end
         -- Normal close path: close + route inside ONE handoff, so a consumer re-opening a panel in its callback
         -- (the search step-back) coalesces with the teardown into a single zone reflow (no flicker).
+        -- `opts.replace_before_close` (see the tint backend): the consumer's route re-opens a dock in THIS finder's
+        -- area zone, so route FIRST — its `surface.open` evicts this finder in the background (after the new
+        -- windows hold focus, no editor focus-fall) — then the explicit close is a no-op. Default: close-first.
         with_handoff(function()
-            if state.st then
-                pcall(state.st.close) -- triggers surface on_close → resource cleanup below
-            end
-            if #items == 0 then
-                if opts.on_cancel then
-                    opts.on_cancel()
+            local function route()
+                if #items == 0 then
+                    if opts.on_cancel then
+                        opts.on_cancel()
+                    end
+                    return
                 end
-                return
+                confirmed = true
+                if method == "qf" then
+                    to_quickfix(items)
+                else
+                    do_open()
+                end
             end
-            confirmed = true
-            if method == "qf" then
-                to_quickfix(items)
+            if opts.replace_before_close then
+                route()
+                if state.st then
+                    pcall(state.st.close)
+                end
             else
-                do_open()
+                if state.st then
+                    pcall(state.st.close) -- triggers surface on_close → resource cleanup below
+                end
+                route()
             end
         end)
     end

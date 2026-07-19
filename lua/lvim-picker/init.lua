@@ -512,6 +512,7 @@ end
 ---@field grep? LvimPickerGrepSpec  the GREP controller (Variant B): hold ALL rg matches in the native blob; the MODE (grep|filter) decides whether the typed query drives rg or fuzzy-filters the frozen blob; requires ABI ≥ 5
 ---@field on_confirm fun(item: any)  called with the chosen item's source value
 ---@field on_cancel? fun()  called when the finder is dismissed without a choice (incl. replaced by the next finder)
+---@field replace_before_close? boolean  run on_confirm/on_cancel/row-actions BEFORE closing the finder — the callback re-opens a dock in THIS finder's area zone, so its `surface.open` evicts the finder in the background (after the new windows hold focus) instead of a focus-fall to the editor. The finder's own close after is a no-op. Set by lvim-space search.
 ---@field on_close? fun()  finder-owned teardown run on close (e.g. a live source killing its in-flight process)
 ---@field format? fun(item: any): string  display text for a table item (default: `item.text`)
 ---@field preview? fun(item: any): string[], string?, integer?  preview lines (+ a filetype, + a 1-based focus line) per selection (SYNCHRONOUS, in-memory finders)
@@ -1812,15 +1813,30 @@ build = function(opts, kind)
             error(err)
         end
     end
+    -- `opts.replace_before_close`: the consumer's callback OPENS a replacement dock in the same area zone (the
+    -- lvim-space search step-back re-opens its panel). Run the callback FIRST so the new dock's `surface.open`
+    -- sees this finder as the area occupant and closes it in the BACKGROUND after its own windows exist + hold
+    -- focus (no editor focus-fall / tremble). The explicit `st.close()` after is then a no-op (already closed).
+    -- Default (nil) keeps close-first, which other consumers rely on.
     confirm = function()
         local it = state.filtered[state.sel]
         state.handled = true -- we own the outcome → on_close must not also fire on_cancel
         with_handoff(function()
-            if state.st then
-                state.st.close()
+            local function route()
+                if it and opts.on_confirm then
+                    opts.on_confirm(it._src)
+                end
             end
-            if it and opts.on_confirm then
-                opts.on_confirm(it._src)
+            if opts.replace_before_close then
+                route()
+                if state.st then
+                    state.st.close()
+                end
+            else
+                if state.st then
+                    state.st.close()
+                end
+                route()
             end
         end)
     end
@@ -1829,11 +1845,18 @@ build = function(opts, kind)
         vim.cmd("stopinsert")
         state.handled = true -- deliver on_cancel HERE (not again from on_close)
         with_handoff(function()
-            if state.st then
-                state.st.close()
-            end
-            if opts.on_cancel then
-                opts.on_cancel()
+            if opts.replace_before_close and opts.on_cancel then
+                opts.on_cancel() -- opens the replacement dock, which evicts this finder in the background
+                if state.st then
+                    state.st.close() -- idempotent (already evicted)
+                end
+            else
+                if state.st then
+                    state.st.close()
+                end
+                if opts.on_cancel then
+                    opts.on_cancel()
+                end
             end
         end)
     end
@@ -1936,6 +1959,12 @@ build = function(opts, kind)
         -- Wrap the WHOLE action in a handoff: a row action's `close` re-opens the launching panel right after
         -- dismissing the finder (the search <BS> step-back), so the picker teardown and that re-open coalesce
         -- into one zone reflow (no backdrop flicker on the way back), same as confirm/cancel.
+        -- With `replace_before_close` the action re-opens its panel BEFORE calling `close` — that re-open evicts
+        -- this finder (its `surface.on_close` runs THEN). Mark `state.handled` NOW so that eviction-driven
+        -- on_close does not ALSO fire `on_cancel` and re-open the panel a second time.
+        if opts.replace_before_close then
+            state.handled = true
+        end
         with_handoff(function()
             run(it._src, function()
                 state.handled = true -- the row action owns the outcome → on_close must not fire on_cancel
