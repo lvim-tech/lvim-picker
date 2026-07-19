@@ -318,6 +318,15 @@ require("lvim-picker").setup({
     fuzzy = {
         sort = "score", -- ordering: "score" | a list of sort keys | a function
         max_results = 1000, -- cap on ranked results (lvim-fuzzy's own max_results also applies)
+        -- FILENAME BIAS (tint backend). Fuzzy matching is a subsequence match against the WHOLE path, so
+        -- `vgit.lua` also matches every `.lua` file under a `…-git/` dir (`git` from the dir, `.lua` from the
+        -- extension). This biases toward the file NAME:
+        --   "boost"  — (default) rows whose NAME matches rank above path-only matches (which still show below);
+        --              a name match = every query term is a subsequence of the basename; its highlight is drawn
+        --              on the name, not a dir+extension scatter. (Contiguity still wins WITHIN a bucket.)
+        --   "strict" — only name matches are kept; the directory path is a tiebreak only.
+        --   "off"    — no bias: whole-path fuzzy (exact fzf parity).
+        filename_match = "boost",
     },
 })
 ```

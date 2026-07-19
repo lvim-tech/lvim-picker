@@ -1013,8 +1013,10 @@ build = function(opts, kind)
                     local q = state.live_query
                     if q and q ~= "" then
                         -- through the shared term matcher, so a multi-term query lights up EVERY term (the
-                        -- filter and the highlight must agree on what matched — see fuzzy.match_terms)
-                        it.match = fuzzy.match_terms(q, it.text)
+                        -- filter and the highlight must agree on what matched). `match_display` is name-focused
+                        -- when `filename_match` is on and this row's NAME matches (so the highlight agrees with
+                        -- the filename-bias ranking); else it is the whole-path term positions.
+                        it.match = fuzzy.match_display(q, it.text)
                     end
                     it._match_done = true
                 end
@@ -1778,26 +1780,62 @@ build = function(opts, kind)
             end)
         end
     end
+    -- Coalesce the picker teardown with whatever a consumer opens in its callback (lvim-space re-opening a
+    -- panel on the search step-back) into ONE zone reflow — identical to the fzf backend's `with_handoff` — so
+    -- the shared area zone and its backdrop never collapse-then-regrow between the two surfaces (the flicker on
+    -- the way back). `surface.zone_handoff` routes to the host zone's coalescer (msgarea's lazyredraw + single
+    -- flush), so close + re-open paint as one frame. Off the area zone there is no shared zone to coalesce.
+    local function with_handoff(fn)
+        -- HOLD the backdrop across the teardown + the tick after it — for EVERY layout (same as the fzf backend):
+        -- closing this surface drops focus to the editor, and Neovim applies that focus-fall a beat after the
+        -- frame, so the focus-aware veil would lift (bright editor) before the consumer's reopened panel re-dims
+        -- it. The hold suppresses that lift; the scheduled release reconciles against the settled focus. The lift
+        -- race is focus-driven (layout-independent); the ZONE handoff below is the area-only coalescing part.
+        local ok_dim, dim = pcall(require, "lvim-utils.dim")
+        local held = ok_dim and type(dim.hold_backdrop) == "function"
+        if held then
+            dim.hold_backdrop(true)
+        end
+        local ok, err = pcall(function()
+            if opts.layout == "area" then
+                require("lvim-ui.surface").zone_handoff(fn)
+            else
+                fn()
+            end
+        end)
+        if held then
+            -- Event-driven release: settle on a protected WinEnter (the reopened panel), not a fixed schedule
+            -- that could land on the transient editor focus-fall and reconcile to a lift.
+            dim.release_backdrop_when_settled()
+        end
+        if not ok then
+            error(err)
+        end
+    end
     confirm = function()
         local it = state.filtered[state.sel]
         state.handled = true -- we own the outcome → on_close must not also fire on_cancel
-        if state.st then
-            state.st.close()
-        end
-        if it and opts.on_confirm then
-            opts.on_confirm(it._src)
-        end
+        with_handoff(function()
+            if state.st then
+                state.st.close()
+            end
+            if it and opts.on_confirm then
+                opts.on_confirm(it._src)
+            end
+        end)
     end
     -- Dismiss the finder (no choice). Shared by the prompt (<C-c>) and NORMAL-mode list (q / <Esc>).
     cancel = function()
         vim.cmd("stopinsert")
         state.handled = true -- deliver on_cancel HERE (not again from on_close)
-        if state.st then
-            state.st.close()
-        end
-        if opts.on_cancel then
-            opts.on_cancel()
-        end
+        with_handoff(function()
+            if state.st then
+                state.st.close()
+            end
+            if opts.on_cancel then
+                opts.on_cancel()
+            end
+        end)
     end
     -- MODE-AWARE footer legend. The move keys differ by focus — in the PROMPT (insert) `C-j`/`C-k` move the
     -- selection (`j`/`k` would type); in the NORMAL list `j`/`k` move and the filter hotkeys (`Tab` mark,
@@ -1895,12 +1933,17 @@ build = function(opts, kind)
         for _, s in ipairs(state.marked) do
             marked[#marked + 1] = s
         end
-        run(it._src, function()
-            state.handled = true -- the row action owns the outcome → on_close must not fire on_cancel
-            if state.st then
-                state.st.close()
-            end
-        end, marked)
+        -- Wrap the WHOLE action in a handoff: a row action's `close` re-opens the launching panel right after
+        -- dismissing the finder (the search <BS> step-back), so the picker teardown and that re-open coalesce
+        -- into one zone reflow (no backdrop flicker on the way back), same as confirm/cancel.
+        with_handoff(function()
+            run(it._src, function()
+                state.handled = true -- the row action owns the outcome → on_close must not fire on_cancel
+                if state.st then
+                    state.st.close()
+                end
+            end, marked)
+        end)
     end
 
     -- layout: a centred float (default), a "bottom" dock that FLOATS over the bottom rows (statusline

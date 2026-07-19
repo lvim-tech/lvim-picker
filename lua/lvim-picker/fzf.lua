@@ -643,10 +643,32 @@ function M.open(opts)
     --- the way back). Routed through `surface.zone_handoff` (the zone registers the coalescer) so the picker
     --- never requires msgarea. Off the area zone there is nothing to coalesce, so just run it.
     local function with_handoff(fn)
-        if opts.layout == "area" then
-            surface.zone_handoff(fn)
-        else
-            fn()
+        -- HOLD the backdrop across the whole teardown AND the tick after it — for EVERY layout, not just area.
+        -- Closing this surface makes focus fall to the editor, and Neovim applies that terminal focus-fall a beat
+        -- AFTER the frame — the focus-aware veil would lift there (bright editor) before the consumer's reopened
+        -- panel/float regains focus and re-dims it: a one-frame backdrop flash on the way back (confirm / cancel /
+        -- step-back). The hold suppresses that lift; the scheduled release RECONCILES against the settled focus
+        -- (a protected surface focused → stays dim; genuinely the editor → lifts). This is focus-driven, so it is
+        -- INDEPENDENT of layout; the ZONE handoff below (coalesce the reflow) is the area-only part.
+        local ok_dim, dim = pcall(require, "lvim-utils.dim")
+        local held = ok_dim and type(dim.hold_backdrop) == "function"
+        if held then
+            dim.hold_backdrop(true)
+        end
+        local ok, err = pcall(function()
+            if opts.layout == "area" then
+                surface.zone_handoff(fn)
+            else
+                fn()
+            end
+        end)
+        if held then
+            -- EVENT-DRIVEN release (not a blind schedule): wait until focus rests on the reopened panel, so the
+            -- transient terminal focus-fall after the close can't reconcile to a lift (the second flash).
+            dim.release_backdrop_when_settled()
+        end
+        if not ok then
+            error(err)
         end
     end
     --- `lines` = every line fzf wrote to the outfile. With `--expect` (a quickfix key configured), line 1 is
@@ -715,9 +737,19 @@ function M.open(opts)
         -- never close → no flicker) and keep or drop focus per `keep_focus`. A cancel or the quickfix key falls
         -- through to the normal close path.
         local lay = opts.layout
-        -- `auto_hide` / `keep_focus` come from the CENTRAL geometry (config.dock.geometry.<layout> via dock.slot).
+        -- `auto_hide` / `keep_focus` come from the CENTRAL geometry (config.dock.geometry.<layout> via dock.slot),
+        -- BUT a per-call `opts.force[lay].auto_hide` (the documented per-open geometry override) WINS — the surface
+        -- honours it, so the keep-open check must too. A consumer whose on_confirm steps BACK to a launching panel
+        -- (lvim-space search) forces `auto_hide = true` to make the finder ONE-SHOT even though the global
+        -- `area.auto_hide` is false; without this fzf keeps the finder open and restarts its terminal in place while
+        -- the consumer reopens its panel — the two then fight over the same area zone (a flicker / stray editor frame).
         local lslot = require("lvim-utils.dock").slot(lay)
-        local keep_open = (lay == "area" or lay == "bottom") and not lslot.auto_hide and #items > 0 and method ~= "qf"
+        local forced_ah = opts.force and opts.force[lay] and opts.force[lay].auto_hide
+        local auto_hide = forced_ah
+        if auto_hide == nil then
+            auto_hide = lslot.auto_hide
+        end
+        local keep_open = (lay == "area" or lay == "bottom") and not auto_hide and #items > 0 and method ~= "qf"
         if keep_open then
             do_open()
             local pan = state.list_pan

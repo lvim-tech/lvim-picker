@@ -259,6 +259,122 @@ local function query_terms(query)
     return out
 end
 
+--- The BASENAME match of `text` for `terms`: 0-based positions (union of every term), OFFSET into full-path
+--- coordinates so a highlight lands on the name in the whole path — or nil when ANY term is not a subsequence
+--- of the basename (the segment after the last "/"). Tested on the name ALONE, so a candidate whose NAME
+--- matches counts even when the whole-path engine aligned across the directory (e.g. `blame.lua` "matches"
+--- `vgit.lua` only via the dir `git` + the `.lua` extension → nil here). Shared by the ranking bias AND the
+--- display highlight so they always agree on "name match". This is a PATH concern, hence Lua-side, never in
+--- the generic lvim-fuzzy scorer.
+---@param terms string[]
+---@param text string
+---@return integer[]|nil
+local function basename_positions(terms, text)
+    local slash = text:find("/[^/]*$") -- 1-based index of the last "/" (nil = no directory part)
+    local off = slash or 0 -- bytes before the basename → the offset to lift name positions into path coords
+    local base = text:sub(off + 1)
+    local hits = {}
+    for _, t in ipairs(terms) do
+        local bm = utils.match_indices(t, base) -- 0-based positions within the basename, or nil
+        if not bm then
+            return nil
+        end
+        for _, ci in ipairs(bm) do
+            hits[ci + off] = true
+        end
+    end
+    local out = {}
+    for ci in pairs(hits) do
+        out[#out + 1] = ci
+    end
+    table.sort(out)
+    return out
+end
+
+--- Order the NAME-match rows by how well the query matches the NAME itself — NOT the whole path. Without this
+--- the bucket keeps the engine's whole-path order, so a contiguous name match (`vgit.lua`) buried in a long
+--- path loses to a SCATTERED name match (`lvim-git.txt`) whose short path merely scored higher end-to-end. The
+--- basenames are re-scored by the engine (the longest term drives it, like the main match); the whole-path
+--- order is the stable tiebreak among equal name scores.
+---@param named table[]  the name-match rows (reordered in place)
+---@param terms string[]
+---@param text_of fun(r: table): string  a row's full path
+local function order_by_name(named, terms, text_of)
+    if #named < 2 then
+        return
+    end
+    local needle = ""
+    for _, t in ipairs(terms) do
+        if #t > #needle then
+            needle = t
+        end
+    end
+    if needle == "" then
+        return
+    end
+    local bases = {}
+    for i, r in ipairs(named) do
+        local text = text_of(r)
+        local slash = text:find("/[^/]*$")
+        bases[i] = text:sub((slash or 0) + 1)
+    end
+    local score = {}
+    for _, e in ipairs(engine.filter(bases, needle) or {}) do
+        score[e.index] = e.score
+    end
+    local order = {}
+    for i, r in ipairs(named) do
+        order[i] = { r = r, s = score[i] or -math.huge, i = i }
+    end
+    table.sort(order, function(a, b)
+        if a.s ~= b.s then
+            return a.s > b.s -- best NAME score first (contiguity wins)
+        end
+        return a.i < b.i -- stable: keep the whole-path order among equal name scores
+    end)
+    for i, o in ipairs(order) do
+        named[i] = o.r
+    end
+end
+
+--- Bias ENGINE-ranked rows toward FILENAME matches (`config.filename_match`). ORTHOGONAL to the engine's
+--- contiguity scoring: within either bucket the engine order is preserved, so a contiguous name still beats a
+--- scattered one. A name match's highlight is recomputed on the basename so the NAME lights up, not a dir +
+--- extension scatter.
+---   "boost" (default): name matches first, then the path-only matches (still shown, below).
+---   "strict":          only name matches kept; the directory path is left as the existing tiebreak.
+---   "off":             no bias — whole-path fuzzy (fzf parity).
+---@param out { idx: integer, match?: integer[] }[]  engine-ranked rows
+---@param terms string[]  the query's AND-terms
+---@param texts string[]  the candidate pool
+---@return { idx: integer, match?: integer[] }[]
+local function filename_bias(out, terms, texts)
+    local mode = (config or {}).filename_match or "boost"
+    if mode == "off" or #out == 0 or #terms == 0 then
+        return out
+    end
+    local named, rest = {}, {}
+    for _, r in ipairs(out) do
+        local m = basename_positions(terms, texts[r.idx] or "")
+        if m then
+            r.match = m
+            named[#named + 1] = r
+        else
+            rest[#rest + 1] = r
+        end
+    end
+    order_by_name(named, terms, function(r)
+        return texts[r.idx] or ""
+    end)
+    if mode == "strict" then
+        return named
+    end
+    for _, r in ipairs(rest) do
+        named[#named + 1] = r
+    end
+    return named
+end
+
 --- Rank `texts` against `query`. `cb` receives a list of `{ idx, match? }` in ranked order — `idx` is the
 --- 1-based index into `texts`, `match` the 0-based matched-char indices (for highlighting; absent on an
 --- empty query). Empty query = the first `max_results` in source order, no match. The match itself is a
@@ -340,7 +456,7 @@ function M.filter(texts, query, cb)
                     out[#out + 1] = { idx = idx, match = match }
                 end
             end
-            deliver(out)
+            deliver(filename_bias(out, terms, texts))
         end)
         return
     end
@@ -354,7 +470,7 @@ function M.filter(texts, query, cb)
             local idx = results[k].index
             out[k] = { idx = idx, match = utils.match_indices(needle, texts[idx]) }
         end
-        deliver(out)
+        deliver(filename_bias(out, terms, texts))
     end)
 end
 
@@ -495,13 +611,59 @@ function M.blob_filter(blob, query, cb)
                 ranked[#ranked + 1] = { idx = idx, text = text }
             end
         end
+        -- Same FILENAME BIAS as the per-string path (config.filename_match): rows whose NAME matches rank above
+        -- (boost) / instead of (strict) the path-only ones. Positions are not attached here (the caller lights
+        -- up the visible rows via M.match_display, which is name-focused for the same rows), so this only
+        -- REORDERS + adjusts the strict total.
+        local mode = (config or {}).filename_match or "boost"
+        local total_out = (#terms > 1) and #ranked or (total or #ranked)
+        if mode ~= "off" and #ranked > 0 and #terms > 0 then
+            local named, rest = {}, {}
+            for _, r in ipairs(ranked) do
+                if basename_positions(terms, r.text) then
+                    named[#named + 1] = r
+                else
+                    rest[#rest + 1] = r
+                end
+            end
+            order_by_name(named, terms, function(r)
+                return r.text
+            end)
+            if mode == "strict" then
+                ranked, total_out = named, #named
+            else
+                for _, r in ipairs(rest) do
+                    named[#named + 1] = r
+                end
+                ranked = named
+            end
+        end
         cb(
             apply_sort(ranked, function(r)
                 return r.text
             end),
-            (#terms > 1) and #ranked or (total or #ranked)
+            total_out
         )
     end)
+end
+
+--- Match positions for DISPLAY highlighting. When `filename_match` is on and `text`'s NAME matches the query,
+--- the highlight is the BASENAME positions (so the name lights up, agreeing with the ranking bias); otherwise
+--- the whole-path term positions. Falls back to `match_terms` for path-only rows and when the bias is off.
+---@param query string
+---@param text string
+---@return integer[]|nil
+function M.match_display(query, text)
+    if ((config or {}).filename_match or "boost") ~= "off" then
+        local terms = query_terms(query)
+        if #terms > 0 then
+            local bp = basename_positions(terms, text)
+            if bp then
+                return bp
+            end
+        end
+    end
+    return M.match_terms(query, text)
 end
 
 return M

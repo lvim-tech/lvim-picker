@@ -21,6 +21,19 @@ return {
     --   "score"  ·  { "dirs_first", "score" }  ·  { "score", "dirs_first" }  ·  { "ext", "alpha" }
     sort = "score",
 
+    -- FILENAME BIAS — how much the FILE NAME (the segment after the last "/") outweighs the directory path
+    -- when ranking path candidates (files / directories). Fuzzy matching is a subsequence match against the
+    -- WHOLE path, so a query like `vgit.lua` also matches every `.lua` file under a `…-git/` dir (the `git`
+    -- comes from the directory, `.lua` from the extension). This biases the result toward the NAME instead:
+    --   "boost"  — (DEFAULT) rows whose NAME matches the query rank ABOVE rows that only match via the path;
+    --              the path-only matches still appear, below. A "name match" = every query term is a
+    --              subsequence of the basename (tested on its own, so the name counts even when the engine
+    --              aligned across the directory). Its highlight is redrawn on the name (not a path scatter).
+    --   "strict" — ONLY rows whose NAME matches are kept; the directory path is used solely as a tiebreak.
+    --   "off"    — no bias: whole-path fuzzy (exact fzf parity — matches spread across dir + extension show).
+    -- Applies to the tint-list backend only (the fzf-TUI backend uses fzf's own matcher).
+    filename_match = "boost",
+
     -- Hard cap on how many ranked results are BUILT + handed back per query. The lvim-fuzzy engine still
     -- searches the WHOLE candidate set — this only limits how many of the top matches we materialise +
     -- render, so a broad / empty query over a huge tree (e.g. `~/`) stays instant instead of building hundreds
