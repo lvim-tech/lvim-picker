@@ -109,7 +109,7 @@ end
 ---@type { texts: string[], len: integer, ctx: LvimFuzzyContext }?
 local _ctx_cache
 
-local uv = vim.uv or vim.loop
+local uv = vim.uv
 
 -- BOUNDED MARSHALING. Feeding a streamed pool (up to ~2M paths) into the native matcher is O(pool) Lua↔C
 -- string work — a single whole prepare / large append blocks the UI for 50–80 ms at scale (measured). So we
