@@ -1101,7 +1101,7 @@ function M.open(opts)
                 end
             end
         end
-        -- NORMAL mode on the list (Telescope-style): <Esc> leaves fzf's input WITHOUT closing — fzf keeps
+        -- NORMAL mode on the list: <Esc> leaves fzf's input WITHOUT closing — fzf keeps
         -- running, and a normal-mode overlay drives it. `j`/`k` chansend Down/Up into the fzf PTY (so it moves
         -- the selection + the preview follows via the focus fifo); `i`/`a` return to typing; `<CR>` accepts;
         -- `q`/`<Esc>` close (send fzf its abort). The surface keys (rotate, panel nav) are also live here.

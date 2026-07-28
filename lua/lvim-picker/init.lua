@@ -2109,7 +2109,7 @@ build = function(opts, kind)
             state.st.set_footer({ bars = { { items = build_footer(ctx) } } })
         end
     end
-    -- Telescope-style modes: the prompt is INSERT (fuzzy type); <Esc> drops to NORMAL on the list (j/k move,
+    -- TWO MODES: the prompt is INSERT (fuzzy type); <Esc> drops to NORMAL on the list (j/k move,
     -- <C-l>/<C-h> panel nav, the filter bar) — `focus_input` returns to typing, `focus_list` leaves insert.
     focus_input = function()
         local w = state.input_buf and vim.fn.bufwinid(state.input_buf) or -1
@@ -2416,7 +2416,7 @@ build = function(opts, kind)
                                 end)
                             end
                         end
-                        -- Telescope-style: <Esc> / <C-f> drop to NORMAL on the list (where the filter hotkeys
+                        -- <Esc> / <C-f> drop to NORMAL on the list (where the filter hotkeys
                         -- activate directly — typing in INSERT would feed them to the query). <C-f> in normal
                         -- toggles back to typing.
                         imap("<Esc>", focus_list)
