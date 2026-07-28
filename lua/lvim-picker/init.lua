@@ -216,6 +216,69 @@ local function filter(items, query, cb)
     end)
 end
 
+--- Scroll a row HORIZONTALLY so its match stays on screen, the way fzf does. A grep result is
+--- `path:lnum:col:text`, and on a long line the match can sit far past the window's right edge —
+--- the row then shows a locator and a stretch of text that says nothing about why it matched.
+---
+--- The LOCATOR is never cut: it is the part that identifies the hit. Only the text after it is
+--- scrolled, with an ellipsis marking what was dropped, and the match spans move with it — a span
+--- that scrolls out is dropped rather than left pointing at the wrong characters.
+---@param row string
+---@param spans { c0: integer, c1: integer }[]
+---@param lead integer  byte offset where the row's label starts (past the mark column)
+---@param width integer  the list window's width in cells
+---@param ellipsis string
+---@return string, { c0: integer, c1: integer }[]
+local function clip_row(row, spans, lead, width, ellipsis)
+    if width <= 0 or #spans == 0 or vim.fn.strdisplaywidth(row) <= width then
+        return row, spans
+    end
+    -- The furthest match decides: if it already fits, nothing is gained by scrolling.
+    local last = spans[1]
+    for _, sp in ipairs(spans) do
+        if sp.c1 > last.c1 then
+            last = sp
+        end
+    end
+    if vim.fn.strdisplaywidth(row:sub(1, last.c1)) <= width then
+        return row, spans
+    end
+    -- Everything up to and including `path:lnum:col:` stays put.
+    local locator = row:sub(lead + 1):match("^[^:]*:%d+:%d+:") or row:sub(lead + 1):match("^[^:]*:%d+:")
+    local keep = lead + (locator and #locator or 0)
+    if last.c0 <= keep then
+        return row, spans
+    end
+    -- Put the match a third of the way into the room that is left, so its context comes with it.
+    local room = width - vim.fn.strdisplaywidth(row:sub(1, keep)) - vim.fn.strdisplaywidth(ellipsis)
+    if room <= 8 then
+        return row, spans
+    end
+    local target = math.max(0, math.floor(room / 3))
+    local cut = keep
+    while cut < last.c0 and vim.fn.strdisplaywidth(row:sub(cut + 1, last.c0)) > target do
+        cut = cut + 1
+        -- never cut inside a multi-byte character
+        while cut < #row and row:byte(cut + 1) >= 0x80 and row:byte(cut + 1) < 0xC0 do
+            cut = cut + 1
+        end
+    end
+    if cut <= keep then
+        return row, spans
+    end
+    local out = row:sub(1, keep) .. ellipsis .. row:sub(cut + 1)
+    local shift = #ellipsis - (cut - keep)
+    local moved = {}
+    for _, sp in ipairs(spans) do
+        if sp.c0 >= cut then
+            moved[#moved + 1] = { c0 = sp.c0 + shift, c1 = sp.c1 + shift }
+        elseif sp.c1 <= keep then
+            moved[#moved + 1] = sp
+        end
+    end
+    return out, moved
+end
+
 --- Build a list ROW for a grid item: `<lead> icon text`, plus the BYTE spans of its matched label characters
 --- and the byte length of the leading column. `marked` swaps the leading blank for the mark dot.
 ---@param it table
@@ -230,6 +293,17 @@ local function list_row(it, marked, dot)
     local text = it.text or ""
     local row = lead .. icon .. text
     local spans = {}
+    -- EXPLICIT BYTE SPANS WIN. A grep row's real match is the one ripgrep found, at a known
+    -- line:col in the TEXT — marking that says why the row is here. The fuzzy display match is
+    -- computed over the whole row, path included, so on a location row it lights up scattered
+    -- letters of the directory name and buries the thing the reader searched for.
+    if it.match_bytes and #it.match_bytes > 0 then
+        local base = #lead + #icon
+        for _, sp in ipairs(it.match_bytes) do
+            spans[#spans + 1] = { c0 = base + sp.c0, c1 = base + sp.c1 }
+        end
+        return row, spans, #lead
+    end
     if it.match and #it.match > 0 then
         local base = #lead + #icon -- byte offset of the label within `row`
         local nch = vim.fn.strchars(text)
@@ -605,6 +679,11 @@ build = function(opts, kind)
     local function hl(key, default)
         return phl[key] or default
     end
+    -- The mark for text scrolled out of a row's left edge; false switches the scrolling off.
+    local clip_ellipsis = opts.list_clip
+    if clip_ellipsis == nil then
+        clip_ellipsis = pkcfg.list_clip
+    end
     local empty_text = opts.empty_text or pkcfg.empty_text or "[no matches]"
     local empty_preview = opts.empty_preview or pkcfg.empty_preview or "Nothing to preview"
     local prevcfg = pkcfg.preview or {}
@@ -651,6 +730,51 @@ build = function(opts, kind)
     -- The GREP controller (assigned after `refilter`, referenced by it + the keymaps): (re)start rg for a query,
     -- stop the in-flight rg, and the Ctrl-g grep⇄filter toggle. Nil for non-grep finders.
     local grep_start, grep_stop, grep_toggle
+
+    --- Every match of `pattern` in `lines`, as byte ranges. The pattern is what the reader typed into a LIVE
+    --- grep, i.e. a ripgrep regex — so it is tried as a Vim regex first (the two agree on the constructs a
+    --- reader actually types at a prompt) and, when that does not compile or finds nothing, as a plain literal.
+    --- Bounded by construction: the previewed slice is at most `preview_max_lines` long and each line yields at
+    --- most one range per starting column.
+    ---@param lines string[]
+    ---@param pattern string?
+    ---@return { row: integer, c0: integer, c1: integer }[]
+    local function preview_matches(lines, pattern)
+        if type(pattern) ~= "string" or pattern == "" then
+            return {}
+        end
+        local out = {}
+        local ok, rx = pcall(vim.regex, pattern)
+        local lower = pattern:lower()
+        for i, line in ipairs(lines) do
+            local row, from = i - 1, 0
+            if ok and rx then
+                while from <= #line do
+                    local s0, e0 = rx:match_str(line:sub(from + 1))
+                    if s0 == nil or e0 <= s0 then
+                        break
+                    end
+                    out[#out + 1] = { row = row, c0 = from + s0, c1 = from + e0 }
+                    from = from + e0
+                end
+            end
+            if from == 0 then
+                -- No regex hit on this line: fall back to a case-insensitive literal, which is what a
+                -- reader typing a bare word means and what ripgrep's smart-case gives them.
+                local hay, needle = line:lower(), lower
+                local at = 1
+                while true do
+                    local s0, e0 = hay:find(needle, at, true)
+                    if s0 == nil then
+                        break
+                    end
+                    out[#out + 1] = { row = row, c0 = s0 - 1, c1 = e0 }
+                    at = e0 + 1
+                end
+            end
+        end
+        return out
+    end
 
     -- ── multi-select marking + quickfix (config.keys.mark / .quickfix, shared with the fzf backend) ──
     local pkc = (config or {})
@@ -729,6 +853,16 @@ build = function(opts, kind)
     -- revert to the global) — no marker, no global mutation. (No `breakindent`: its virtual indent draws no
     -- text and so cannot carry the row tint — it would leave an un-tinted notch; instead continuations sit
     -- at column 0 as REAL wrapped text, fully covered by the row's `hl_eol` stripe.)
+    --- The list window's width in cells, or 0 while it has none yet (the first render before layout).
+    ---@return integer
+    local function list_width()
+        local p = state.list_pan
+        if p and p.win and api.nvim_win_is_valid(p.win) then
+            return api.nvim_win_get_width(p.win)
+        end
+        return 0
+    end
+
     local function tame_win(win, wrap)
         if win and api.nvim_win_is_valid(win) then
             vim.wo[win].wrap = wrap or false
@@ -1012,7 +1146,23 @@ build = function(opts, kind)
                 -- a stale query's spans.
                 if (opts.source or state.blob) and not it._match_done then
                     local q = state.live_query
-                    if q and q ~= "" then
+                    -- A LOCATION ROW carries the answer already: ripgrep matched the line and said
+                    -- where. Mark that, in the TEXT after the locator, and leave the path alone.
+                    local src = it._src
+                    if type(src) == "table" and src.col and src.lnum and q and q ~= "" then
+                        local locator = (it.text or ""):match("^[^:]*:%d+:%d+:")
+                            or (it.text or ""):match("^[^:]*:%d+:%s*")
+                        if locator then
+                            local body = (it.text or ""):sub(#locator + 1)
+                            local found = preview_matches({ body }, q)
+                            local bytes = {}
+                            for _, r in ipairs(found) do
+                                bytes[#bytes + 1] = { c0 = #locator + r.c0, c1 = #locator + r.c1 }
+                            end
+                            it.match_bytes = #bytes > 0 and bytes or nil
+                        end
+                    end
+                    if it.match_bytes == nil and q and q ~= "" then
                         -- through the shared term matcher, so a multi-term query lights up EVERY term (the
                         -- filter and the highlight must agree on what matched). `match_display` is name-focused
                         -- when `filename_match` is on and this row's NAME matches (so the highlight agrees with
@@ -1039,6 +1189,11 @@ build = function(opts, kind)
                     end
                 end
                 local row, spans, lead = list_row(it, marked, marker)
+                -- A match past the window's right edge is a row that says nothing about why it
+                -- matched. Scroll it in, fzf-style, unless the reader asked for wrapping instead.
+                if not list_wrap and clip_ellipsis ~= false then
+                    row, spans = clip_row(row, spans, lead, list_width(), clip_ellipsis or "…")
+                end
                 lines[i] = row
                 local odd = (li % 2) == 1 -- stripe parity by LOGICAL index (stable while scrolling)
                 local sel = li == state.sel
@@ -1211,6 +1366,31 @@ build = function(opts, kind)
                             vim.cmd("normal! zz")
                         end)
                     end
+                    -- WHERE THE MATCHES ARE. Centring the matched LINE answers only half the question a grep
+                    -- result raises; the other half is which characters matched, and on a long line that is
+                    -- the half the reader is actually looking for. Every match of the live pattern in the
+                    -- previewed slice is marked, and the one this result points AT (its own line:col) is
+                    -- marked harder — so the focused hit reads apart from its neighbours.
+                    if prevcfg.match ~= false then
+                        local pattern = state.live_query
+                        if pattern == nil or pattern == "" then
+                            pattern = state.query
+                        end
+                        local ranges = preview_matches(lines, pattern)
+                        for _, r in ipairs(ranges) do
+                            local focused = focus ~= nil
+                                and r.row == focus - 1
+                                and state.preview_col ~= nil
+                                and r.c0 <= state.preview_col - 1
+                                and state.preview_col - 1 < r.c1
+                            pcall(api.nvim_buf_set_extmark, pan.buf, NS, r.row, r.c0, {
+                                end_col = r.c1,
+                                hl_group = focused and hl("preview_match_focus", "LvimUiPeekTitle")
+                                    or hl("preview_match", "LvimUiMsgAreaMatch"),
+                                priority = focused and 260 or 250,
+                            })
+                        end
+                    end
                 end,
                 keys = function(map, pan)
                     state.preview_pan = pan
@@ -1327,7 +1507,8 @@ build = function(opts, kind)
         state.preview_lines = entry.lines
         state.preview_ft = want.ft or entry.ft
         state.preview_focus = want.lnum and math.max(1, math.min(want.lnum, #entry.lines)) or nil
-        state.preview_loc = { path = want.path, lnum = want.lnum }
+        state.preview_col = want.col
+        state.preview_loc = { path = want.path, lnum = want.lnum, col = want.col }
         refit() -- the preview height is capped at max_rows, so this relayouts only on the FIRST load, then holds
         if state.preview_pan and state.preview_pan.refresh then
             state.preview_pan.refresh()
@@ -1366,6 +1547,7 @@ build = function(opts, kind)
         local loc = (it and it._src and opts.preview_file_of and opts.preview_file_of(it._src)) or nil
         if not (loc and loc.path and loc.path ~= "") then
             state.preview_lines, state.preview_ft, state.preview_focus, state.preview_loc = {}, nil, nil, nil
+            state.preview_col = nil
             refit()
             if state.preview_pan and state.preview_pan.refresh then
                 state.preview_pan.refresh()
@@ -1376,7 +1558,7 @@ build = function(opts, kind)
         -- match DEEP in a huge file never materialises tens of thousands of lines on the main thread.
         local span = math.max(500, (loc.lnum or 0) + 200)
         local maxl = math.min(span, (config or {}).preview_max_lines or 2000)
-        preview_want = { sel = state.sel, path = loc.path, lnum = loc.lnum, ft = loc.ft, max = maxl }
+        preview_want = { sel = state.sel, path = loc.path, lnum = loc.lnum, col = loc.col, ft = loc.ft, max = maxl }
         pump_preview()
     end
 
@@ -2960,7 +3142,9 @@ function M.grep(opts)
         -- ASYNC file preview, focused on the matched line — read off the main thread + LRU-cached, so scrolling
         -- grep results (every row a different file:line) follows the cursor instead of a per-move disk read.
         preview_file_of = function(s)
-            return s.path and s.path ~= "" and { path = s.path, lnum = s.lnum } or nil
+            -- The COLUMN travels too: without it the preview can centre the matched LINE but has
+            -- nothing to point at inside it, which is the whole question a grep result raises.
+            return s.path and s.path ~= "" and { path = s.path, lnum = s.lnum, col = s.col } or nil
         end,
         on_confirm = function(it)
             if it and it.path then

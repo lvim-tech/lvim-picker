@@ -302,6 +302,8 @@ return {
         sel_odd = "LvimUiMsgAreaSelOdd",
         sel_even = "LvimUiMsgAreaSelEven",
         match = "LvimUiMsgAreaMatch", -- the fuzzy-matched characters
+        preview_match = "LvimUiMsgAreaMatch", -- every match of the pattern inside the PREVIEW
+        preview_match_focus = "LvimUiPeekTitle", -- the one the focused result points at (line:col)
         -- panel winbars (the lvim-lsp peek look)
         list_title = "LvimUiPeekTitle", -- the list title (single-panel layout)
         list_count = "LvimUiPeekCount", -- the result count
@@ -315,7 +317,20 @@ return {
         show_icon = true, -- show the file's devicon before the name (needs nvim-web-devicons)
         dir_pad_left = 1, -- spaces before the path
         dir_pad_right = 1, -- spaces after the path
+        -- MARK THE MATCHES IN THE PREVIEW. Centring the matched LINE answers only half the question a
+        -- grep result raises; the other half is WHICH characters matched, and on a long line that is
+        -- the half the reader came for. Every match of the live pattern in the previewed slice is
+        -- marked (`hl.preview_match`) and the one the focused result points at — its own line:col —
+        -- is marked harder (`hl.preview_match_focus`), so the hit reads apart from its neighbours.
+        match = true,
     },
+
+    -- A grep result is `path:lnum:col:text`, and on a long line the match can sit far past the list's
+    -- right edge — the row then shows a locator and a stretch of text that says nothing about why it
+    -- matched. The row is SCROLLED so the match comes into view (the way fzf does it), with this mark
+    -- standing for what was dropped off the left. The locator itself is never cut. `false` switches
+    -- the scrolling off; `list_wrap = true` (soft-wrapped rows) takes precedence over both.
+    list_clip = "…",
 
     -- Shown when there are NO results — in the list body AND in the preview's winbar (where the file name
     -- would be). A per-call `opts.empty_text` overrides it.

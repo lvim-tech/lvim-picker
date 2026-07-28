@@ -306,8 +306,19 @@ require("lvim-picker").setup({
         bar = "LvimUiPeekFileBar",
     },
     -- Preview winbar (the file title bar on the preview panel).
-    preview = { show_icon = true, dir_pad_left = 1, dir_pad_right = 1 },
+    preview = {
+        show_icon = true,
+        dir_pad_left = 1,
+        dir_pad_right = 1,
+        -- mark every match of the live pattern in the preview; the one the focused result
+        -- points at (its own line:col) is marked harder
+        match = true,
+    },
     -- Shown when there are no results (list body + preview winbar).
+    -- A grep row is `path:lnum:col:text`; when the match sits past the list's right edge the row
+    -- is SCROLLED so it comes into view (fzf-style), with this mark for what was dropped off the
+    -- left. The locator is never cut. `false` disables it; `list_wrap = true` wins over both.
+    list_clip = "…",
     empty_text = "[no matches]",
     -- The preview placeholder when nothing is focused.
     empty_preview = "Nothing to preview",
