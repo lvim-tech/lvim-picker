@@ -590,12 +590,13 @@ end
 ---@field on_close? fun()  finder-owned teardown run on close (e.g. a live source killing its in-flight process)
 ---@field format? fun(item: any): string  display text for a table item (default: `item.text`)
 ---@field preview? fun(item: any): string[], string?, integer?  preview lines (+ a filetype, + a 1-based focus line) per selection (SYNCHRONOUS, in-memory finders)
----@field preview_file_of? fun(item: any): { path: string, lnum?: integer, ft?: string }?  map an item to a FILE location previewed ASYNC (read off the main thread, LRU-cached) so the preview follows the cursor while scrolling; used by files/grep
+---@field preview_file_of? fun(item: any): { path: string, lnum?: integer, col?: integer, ft?: string }?  map an item to a FILE location previewed ASYNC (read off the main thread, LRU-cached) so the preview follows the cursor while scrolling; used by files/grep
 ---@field preview_file? boolean  preview the item's REAL file buffer (EDITABLE, 2-way synced) instead of `preview` lines; items need `path` (+ lnum/col)
 ---@field preview_side? "right"|"left"|"dynamic"|"hide"  where the preview sits (default "right"); `dynamic` = full-width list + a peek float above it (native-qf style); `hide` = no preview (toggle with <C-e>)
 ---@field preview_numbers? boolean  show line numbers in the preview (default true)
 ---@field preview_wrap? boolean  soft-wrap the preview (default false)
 ---@field list_wrap? boolean  soft-wrap the list rows (no "↳" marker) so far-right matches stay visible (default false)
+---@field list_clip? string|false  the mark for text scrolled off a row's left edge; `false` switches the row scrolling off (default `config.list_clip`)
 ---@field empty_text? string  shown when there are no results (list body + preview winbar)
 ---@field empty_preview? string  the "nothing to preview" placeholder bar text (default "Nothing to preview")
 ---@field title? string  the finder title — the chassis native centered border-title
@@ -1464,7 +1465,7 @@ build = function(opts, kind)
     local preview_cache = {} ---@type table<string, { lines: string[], ft: string }>
     local preview_lru = {} ---@type string[]  MRU-ordered paths (index 1 = most recently used)
     local preview_inflight = false
-    ---@type { sel: integer, path: string, lnum: integer?, ft: string?, max: integer }?
+    ---@type { sel: integer, path: string, lnum: integer?, col: integer?, ft: string?, max: integer }?
     local preview_want
     --- Look a file up in the LRU cache, promoting it to most-recent on a hit.
     ---@param path string
@@ -1501,7 +1502,7 @@ build = function(opts, kind)
     --- Show `entry`'s lines in the preview, focused on `want.lnum`. `state.preview_loc` records WHICH file is
     --- shown (the render's winbar reads it), so the panel body + title stay consistent even when a read lands a
     --- row or two behind a fast scroll (it converges as the pump reads the current selection next).
-    ---@param want { path: string, lnum: integer?, ft: string? }
+    ---@param want { path: string, lnum: integer?, col: integer?, ft: string? }
     ---@param entry { lines: string[], ft: string }
     local function apply_async_preview(want, entry)
         state.preview_lines = entry.lines
@@ -1701,24 +1702,24 @@ build = function(opts, kind)
             -- counter `matched/loaded`. `live_query` is the typed text either way, so the render lights up the
             -- needle (grep) / the fuzzy term (filter) in the VISIBLE rows only.
             if state.grep_mode == "grep" then
-                local q = state.query
-                if #q < (opts.grep.min_chars or 2) then
+                local grep_q = state.query
+                if #grep_q < (opts.grep.min_chars or 2) then
                     grep_stop() -- too short to grep a huge tree → clear the list + counter, wait for more chars
-                    state.grep_query, state.grep_total = q, 0
+                    state.grep_query, state.grep_total = grep_q, 0
                     apply({}, light)
                     return
                 end
-                if q ~= state.grep_query then
+                if grep_q ~= state.grep_query then
                     -- A NEW query → (re)grep into a FRESH (empty) blob; its paced stream ticks call `refilter`
                     -- again (same query) as matches arrive, and THAT is what renders. Do NOT render the empty
                     -- fresh blob here — keep the CURRENT rows on screen until the new results stream in, so
                     -- re-typing a live grep never flashes an empty list between keystrokes (fzf keeps its rows the
                     -- same way while it reloads). Without this, every keystroke cleared the list → the flicker.
-                    grep_start(q)
+                    grep_start(grep_q)
                     return
                 end
                 -- Same query = a stream tick (or a manual refresh): render the (growing) blob in source order.
-                state.live_query = q
+                state.live_query = grep_q
                 if state.blob then
                     fuzzy.blob_filter(state.blob, "", function(list, total)
                         if mygen == refilter_gen then
@@ -1837,7 +1838,7 @@ build = function(opts, kind)
                 return -- blob_new failed (should not happen — opts.grep is only set when fuzzy.has_blob())
             end
             local counter = { total = 0 } -- rg's read callback tallies the TRUE match count in here (incl. overflow)
-            local pending = false
+            local tick_scheduled = false
             --- Push the growing pool + the live tally to the UI (a LIGHT refilter — count + rows only — while
             --- streaming; a FULL final pass fetches the preview + fits the surface).
             ---@param final boolean
@@ -1854,10 +1855,10 @@ build = function(opts, kind)
                     return
                 end
                 fuzzy.blob_append(myblob, data)
-                if not pending then
-                    pending = true
+                if not tick_scheduled then
+                    tick_scheduled = true
                     vim.defer_fn(function()
-                        pending = false
+                        tick_scheduled = false
                         tick(false)
                     end, (config or {}).stream_refresh_ms or 50)
                 end
@@ -2060,49 +2061,49 @@ build = function(opts, kind)
         -- focus / close. The ONLY exception is the cheatsheet: `help` is pulled to the very end and set apart by a
         -- single `●` (config.footer_separator, `LvimUiFooterSep`), so "where the full key list is written down"
         -- reads as its own thing rather than one hint among the actions.
-        local items
+        local hints
         if ctx == "list" then
-            items = {
+            hints = {
                 { key = "<CR>", name = "open" },
                 { key = "j/k", name = "move" },
                 { key = klabel(kcfg.mark), name = "mark" },
                 { key = klabel(kcfg.quickfix), name = "qf" },
             }
         else -- prompt (insert): C-j/k move the selection while you type
-            items = {
+            hints = {
                 { key = "<CR>", name = "open" },
                 { key = "C-j/k", name = "move" },
             }
         end
         if preview_provider then
-            items[#items + 1] = { key = "C-d/u", name = "preview" }
+            hints[#hints + 1] = { key = "C-d/u", name = "preview" }
         end
         for _, a in ipairs(opts.keys or {}) do
             -- a `mode`-restricted row action is only hinted in the context it actually works in
             if a.name and (a.mode == nil or a.mode == (ctx == "list" and "n" or "i")) then
-                items[#items + 1] = { key = a.key, name = a.name }
+                hints[#hints + 1] = { key = a.key, name = a.name }
             end
         end
         if opts.grep and opts.grep.live then
-            items[#items + 1] = { key = klabel(kcfg.grep_filter), name = "grep⇄filter" }
+            hints[#hints + 1] = { key = klabel(kcfg.grep_filter), name = "grep⇄filter" }
         end
         -- ONE name in both contexts: `C-f` is a FOCUS toggle (prompt ⇄ list), not two separate commands. Naming it
         -- after its destination ("list" / "type") read as if the picker had two different keys there.
-        items[#items + 1] = { key = "C-f", name = "focus" }
+        hints[#hints + 1] = { key = "C-f", name = "focus" }
         -- CLOSE is context-aware, because the keys are: the PROMPT (insert) cancels with `<C-c>`; on the LIST
         -- (normal) `q` / `<Esc>` close (there `<C-c>` does nothing, and `<Esc>` from the prompt drops to the list
         -- rather than closing). The footer used to say `C-c` in both, so the hint was wrong the moment you left
         -- the input.
-        items[#items + 1] = ctx == "list" and { key = "q/Esc", name = "close" } or { key = "C-c", name = "close" }
+        hints[#hints + 1] = ctx == "list" and { key = "q/Esc", name = "close" } or { key = "C-c", name = "close" }
         -- help LAST, in its own group: a `●` separator, then the cheatsheet key. LIST context only — in the prompt
         -- the key would type into the query.
         if ctx == "list" then
             local sep = (config or {}).footer_separator or "●"
-            items[#items + 1] =
+            hints[#hints + 1] =
                 { type = "separator", text = sep, style = { padding = { 1, 1 }, hl = "LvimUiFooterSep" } }
-            items[#items + 1] = { key = klabel(kcfg.help), name = "help" }
+            hints[#hints + 1] = { key = klabel(kcfg.help), name = "help" }
         end
-        return items
+        return hints
     end
     local function set_footer_ctx(ctx)
         if state.st and state.st.set_footer then
@@ -2199,9 +2200,9 @@ build = function(opts, kind)
     local function build_prompt(mode)
         local pcfg = (config or {}).prompt or {}
         local sp = string.rep
-        local filter = mode == "filter"
-        local icon = filter and (pcfg.filter_icon or pcfg.icon or "") or (pcfg.icon or "")
-        local label = filter and (pcfg.filter_label or pcfg.label or "") or (pcfg.label or "")
+        local is_filter = mode == "filter"
+        local icon = is_filter and (pcfg.filter_icon or pcfg.icon or "") or (pcfg.icon or "")
+        local label = is_filter and (pcfg.filter_label or pcfg.label or "") or (pcfg.label or "")
         local has_icon = icon ~= ""
         local has_label = label ~= ""
         local badge = sp(" ", pcfg.pad_left or 1)
@@ -2619,7 +2620,7 @@ build = function(opts, kind)
     if state.blob then
         state.src_cache = {} -- native index → derived `_src` item (stable identity for marks; see blob_rows)
         state.pool_n = 0
-        local pending = false
+        local tick_scheduled = false
         --- Ingest one raw stdout chunk into the native pool (no Lua per-row work), then schedule ONE coalesced
         --- light refilter so the count + visible rows track the growing pool.
         ---@param data string
@@ -2628,10 +2629,10 @@ build = function(opts, kind)
                 return
             end
             state.pool_n = fuzzy.blob_append(state.blob, data)
-            if not pending then
-                pending = true
+            if not tick_scheduled then
+                tick_scheduled = true
                 vim.defer_fn(function()
-                    pending = false
+                    tick_scheduled = false
                     if not state.closed then
                         refilter(state.query, true) -- LIGHT: count + rows only (see rerender)
                     end
@@ -2656,7 +2657,7 @@ build = function(opts, kind)
     -- final pass. The producer is killed in on_close. Mutually exclusive with the per-query live `source`. This
     -- is the FALLBACK path (an older .so without blob ingestion) — the blob path above supersedes it when ABI≥5.
     if opts.stream and not opts.source then
-        local pending = false
+        local tick_scheduled = false
         local function feed(raw)
             if state.closed or type(raw) ~= "table" or #raw == 0 then
                 return
@@ -2666,14 +2667,14 @@ build = function(opts, kind)
                 n = n + 1
                 items[n] = it
             end
-            if not pending then
-                pending = true
+            if not tick_scheduled then
+                tick_scheduled = true
                 -- Coalesce a burst of stream chunks into one re-render. Long enough (config.stream_refresh_ms)
                 -- that the async query match SETTLES between refreshes instead of being superseded every time
                 -- (which would show nothing until the stream ended), and it thins the per-refresh ensure_ctx
                 -- append while files pour in.
                 vim.defer_fn(function()
-                    pending = false
+                    tick_scheduled = false
                     if not state.closed then
                         refilter(state.query, true) -- LIGHT: count + rows only, no preview / relayout (see rerender)
                     end
@@ -3206,14 +3207,14 @@ function M.grep(opts)
                     cb({})
                     return
                 end
-                local out, pending = {}, false
+                local out, tick_scheduled = {}, false
                 local function deliver() -- coalesce a burst of drains into one re-render; keep the count live
-                    if pending then
+                    if tick_scheduled then
                         return
                     end
-                    pending = true
+                    tick_scheduled = true
                     vim.defer_fn(function()
-                        pending = false
+                        tick_scheduled = false
                         cb(out)
                     end, (config or {}).stream_refresh_ms or 50)
                 end
@@ -3262,6 +3263,8 @@ function M.grep_visual(opts)
     opts.key = opts.key or "grep_visual"
     local s, e = vim.fn.getpos("'<"), vim.fn.getpos("'>")
     local lines = vim.fn.getline(s[2], e[2])
+    -- The two-argument `getline` always returns the RANGE as a list (the union is the one-argument form).
+    ---@cast lines string[]
     if #lines > 0 then
         lines[#lines] = lines[#lines]:sub(1, e[3])
         lines[1] = lines[1]:sub(s[3])

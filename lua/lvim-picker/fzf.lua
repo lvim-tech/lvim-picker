@@ -170,6 +170,11 @@ local function make_fifo(on_line)
         return nil
     end
     local pipe = uv.new_pipe(false)
+    if not pipe then
+        uv.fs_close(fd)
+        os.remove(path)
+        return nil
+    end
     pipe:open(fd)
     local buf = ""
     pipe:read_start(function(err, data)
@@ -637,7 +642,6 @@ function M.open(opts)
     -- switches (to_insert / <Esc>) inside `start_fzf` can re-render the footer for the new mode via `set_footer`.
     local footer_bands
 
-    local confirmed = false
     --- Run `fn` as a single ZONE HANDOFF when this finder is area-docked: the picker's teardown (release its
     --- zone reserve) and whatever the consumer does in its callback (e.g. lvim-space re-opening a panel —
     --- reserve a segment) coalesce into ONE reflow, instead of the zone collapsing then growing (a flicker on
@@ -738,6 +742,8 @@ function M.open(opts)
         -- never close → no flicker) and keep or drop focus per `keep_focus`. A cancel or the quickfix key falls
         -- through to the normal close path.
         local lay = opts.layout
+        -- Normalised to a concrete layout at the top of `M.open`, so it is never nil here.
+        ---@cast lay "area"|"bottom"|"float"
         -- `auto_hide` / `keep_focus` come from the CENTRAL geometry (config.dock.geometry.<layout> via dock.slot),
         -- BUT a per-call `opts.force[lay].auto_hide` (the documented per-open geometry override) WINS — the surface
         -- honours it, so the keep-open check must too. A consumer whose on_confirm steps BACK to a launching panel
@@ -805,7 +811,6 @@ function M.open(opts)
                     end
                     return
                 end
-                confirmed = true
                 if method == "qf" then
                     to_quickfix(items)
                 else

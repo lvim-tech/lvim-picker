@@ -633,6 +633,12 @@ local function paced_stream(argv, consume, on_done, max_lines, count_opts)
     ---@type vim.SystemObj?  forward-declared so the read callback can kill the producer at the cap
     local sys
     local timer = uv.new_timer()
+    if not timer then
+        -- No pacing timer, no stream — reported the same way a failed spawn is (below): signal done and
+        -- hand back a cancel that has nothing to cancel.
+        vim.schedule(on_done)
+        return function() end
+    end
     local armed = false -- a drain is already scheduled/pending (so the read callback never double-arms)
 
     ---@type fun(ms: integer)

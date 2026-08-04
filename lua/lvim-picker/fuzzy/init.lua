@@ -167,6 +167,9 @@ local function arm_marshal(texts)
     end
     local settled = 0 -- consecutive ticks the context has fully covered a pool that stopped growing
     local timer = uv.new_timer()
+    if not timer then
+        return
+    end
     _marshal_timer = timer
     timer:start(
         40,
